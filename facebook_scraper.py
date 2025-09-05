@@ -15,22 +15,27 @@ import time
 from datetime import datetime
 from loguru import logger
 from pathlib import Path
+
 from playwright.async_api import async_playwright
+from src.resources.fb_groups import fb_groups
 from sold_item_detector import SoldItemDetector
 from src.utils import setup_logging
 
 class FacebookGroupScraper:
-    def __init__(self, download_images=False, sale_posts_only=False, include_sold=True, sold_items_only=False):
+    def __init__(self, download_images=False, sale_posts_only=False, 
+                 include_sold=True, sold_items_only=False, 
+                 use_deep_sold_detection=False, visual_highlight=False):
         self.browser = None
         self.context = None
         self.page = None
         self.posts_data = []
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # NEW: Sale and sold filtering options
+        # Post filtering options
         self.sale_posts_only = sale_posts_only
         self.include_sold = include_sold
-        self.sold_items_only = sold_items_only
+        self.sold_items_only = sold_items_only  # Option 4: Facebook search
+        self.use_deep_sold_detection = use_deep_sold_detection  # Option 5: Deep detection
         self.download_images = download_images
         
         # Create scrapes directory in project root
@@ -55,13 +60,24 @@ class FacebookGroupScraper:
         )
         
         # Initialize sale patterns if any filtering is enabled
-        if sale_posts_only or sold_items_only:
+        if sale_posts_only or sold_items_only or use_deep_sold_detection:
             self._init_sale_patterns()
         
-        # Initialize sold detection if needed
-        if sold_items_only:
+        # Initialize sold detection for either option 4 or 5
+        if sold_items_only or use_deep_sold_detection:
             self.sold_detector = SoldItemDetector()
-            logger.info("Sold items detection enabled")
+            if use_deep_sold_detection:
+                logger.info("Deep sold detection enabled (posts + comments)")
+            else:
+                logger.info("Facebook search sold items mode enabled")
+        
+        # Visual highlighting option
+        self.visual_highlight = visual_highlight
+        if visual_highlight:
+            logger.info("Visual highlighting enabled - containers will be highlighted in browser")
+        
+        # Track absolute post number across all processing
+        self.absolute_post_counter = 0
         
         logger.info(f"FacebookGroupScraper initialized")
         logger.info(f"Session ID: {self.session_id}")
@@ -125,15 +141,19 @@ class FacebookGroupScraper:
 
     ###^ 1- URL NAVIGATION & TRIGGER POSTS
     
-
     async def navigate_to_group(self, group_id):
         """Navigate to a specific group with improved timeout handling"""
         try:
             current_url = self.page.url
             
             if self.sold_items_only:
+                # Option 4: Use Facebook's search
                 target_url = f"https://www.facebook.com/groups/{group_id}/search/?q=sold"
                 logger.info(f"Navigating to group {group_id} with 'sold' search")
+            elif self.use_deep_sold_detection:
+                # Option 5: Stay on regular group page for deep detection
+                target_url = f"https://www.facebook.com/groups/{group_id}"
+                logger.info(f"Navigating to group {group_id} for deep sold detection")
             elif self.sale_posts_only:
                 target_url = f"https://www.facebook.com/groups/{group_id}?filter=sell"
                 logger.info(f"Navigating to group {group_id} with sale filter")
@@ -256,8 +276,32 @@ class FacebookGroupScraper:
     ###^ 2 - MAIN POST SCRAPING METHODS
 
     async def process_post_with_complete_thread(self, containers, main_post_index, post_number):
-        """Process a main post and ALL its comments - with logging"""
-        logger.info(f"Processing post {post_number} at index {main_post_index}")
+        """Process a main post and ALL its comments - with enhanced logging"""
+        
+        # Increment absolute counter
+        self.absolute_post_counter += 1
+        absolute_num = self.absolute_post_counter
+        
+        # Get preview of post text first
+        try:
+            main_container = containers[main_post_index]
+            preview_text = await main_container.text_content(timeout=2000) or ""
+            preview_text = ' '.join(preview_text.split()[:20])  # First 20 words
+            if len(preview_text) > 100:
+                preview_text = preview_text[:100] + "..."
+        except:
+            preview_text = "[Could not get preview]"
+        
+        # Enhanced logging with post number and preview
+        logger.info(f"")  # Blank line for clarity
+        logger.info(f"{'='*60}")
+        logger.info(f"📍 POST #{absolute_num} (container {main_post_index + 1})")
+        logger.info(f"📝 Preview: {preview_text}")
+        logger.info(f"{'='*60}")
+        
+        # Visual highlight if enabled
+        if self.visual_highlight:
+            await self.highlight_element(main_container)
         
         try:
             # Find where this post's comments end
@@ -267,7 +311,7 @@ class FacebookGroupScraper:
             thread_containers = containers[main_post_index:boundary_index]
             thread_size = len(thread_containers)
             
-            logger.debug(f"Complete thread: containers {main_post_index+1} to {boundary_index} ({thread_size} containers)")
+            logger.debug(f"Thread size: {thread_size} containers (post + {thread_size-1} comment containers)")
             
             # The first container is the main post
             main_container = thread_containers[0]
@@ -334,6 +378,9 @@ class FacebookGroupScraper:
         """Main scraping function - with comprehensive logging"""
         logger.info(f"Starting scraping of {num_posts} posts with thread boundary detection")
         
+        # Reset counter for new scraping session
+        self.absolute_post_counter = 0
+        
         posts = []
         scroll_attempts = 0
         max_scrolls = 15
@@ -343,10 +390,7 @@ class FacebookGroupScraper:
         
         while len(posts) < num_posts and scroll_attempts < max_scrolls:
             try:
-                # Get all current containers
                 all_containers = await self.page.locator('[role="article"]').all()
-                
-                # Skip containers we've already processed
                 remaining_containers = all_containers[container_position:]
                 
                 if not remaining_containers:
@@ -356,9 +400,7 @@ class FacebookGroupScraper:
                     scroll_attempts += 1
                     continue
                 
-                logger.debug(f"Examining containers starting from {container_position + 1}")
-                
-                # Find the next main post in the remaining containers
+                # Find next main post
                 next_main_post_index = None
                 for i, container in enumerate(remaining_containers[:15]):
                     try:
@@ -367,21 +409,24 @@ class FacebookGroupScraper:
                         
                         if self.is_main_post_container(text_content, len(html_content)):
                             next_main_post_index = container_position + i
-                            logger.debug(f"Found main post at container {next_main_post_index + 1}")
+                            
+                            # Quick preview for debugging
+                            preview = ' '.join(text_content.split()[:10])
+                            logger.debug(f"Found main post at container {next_main_post_index + 1}: {preview[:50]}...")
                             break
                             
                     except Exception:
                         continue
                 
                 if next_main_post_index is None:
-                    logger.debug("No main post found in current batch, scrolling...")
+                    logger.debug("No main post found, scrolling...")
                     await self.page.keyboard.press('End')
                     await asyncio.sleep(3)
                     scroll_attempts += 1
                     container_position += 5
                     continue
                 
-                # Process this post and its complete comment thread
+                # Process the post
                 post_data, boundary_index = await self.process_post_with_complete_thread(
                     all_containers, 
                     next_main_post_index,
@@ -390,30 +435,33 @@ class FacebookGroupScraper:
                 
                 if post_data and self.validate_main_post_data(post_data):
                     posts.append(post_data)
-                    logger.success(f"Successfully processed post {len(posts)}")
-                    self.print_post_debug_with_comments(post_data)
+                    logger.success(f"✅ Successfully scraped post #{self.absolute_post_counter} -> Saved as post {len(posts)}/{num_posts}")
                     
-                    # Update self.posts_data immediately
+                    # Show key details
+                    self.print_enhanced_post_summary(post_data, self.absolute_post_counter)
+                    
                     self.posts_data = posts.copy()
                     
                     if len(posts) % 3 == 0:
                         logger.info(f"Auto-saving progress at {len(posts)} posts")
                         await self.auto_save(posts)
+                else:
+                    logger.warning(f"❌ Post #{self.absolute_post_counter} failed validation, skipping")
                 
-                # Move position to after this complete thread
+                # Move to next
                 container_position = boundary_index
                 scroll_attempts = 0
                 
             except Exception as e:
-                logger.error(f"Error in boundary detection processing: {str(e)[:100]}")
+                logger.error(f"Error in scraping: {str(e)[:100]}")
                 scroll_attempts += 1
                 container_position += 3
                 continue
         
-        # Final update
         self.posts_data = posts
-        logger.info(f"Completed boundary-aware scraping: {len(posts)} main posts")
+        logger.info(f"Completed scraping: {len(posts)} valid posts from {self.absolute_post_counter} total processed")
         return posts
+
 
     async def scrape_with_sold_detection(self, num_posts=10):
         """Simplified sequential processing - just go through posts 1, 2, 3, 4..."""
@@ -511,6 +559,7 @@ class FacebookGroupScraper:
         logger.success(f"🏁 Sequential processing complete: {len(posts)} sold items found from {posts_processed} posts processed")
         return posts
 
+
     async def scrape_sold_items_from_search(self, num_posts=10):
         """Scrape posts from the 'sold' search results page - no detection needed"""
         logger.info(f"Scraping {num_posts} posts from 'sold' search results")
@@ -600,6 +649,200 @@ class FacebookGroupScraper:
         logger.info(f"Completed sold search scraping: {len(posts)} posts")
         return posts
 
+    async def scrape_with_deep_sold_detection(self, num_posts=10):
+        """Deep detection with enhanced logging"""
+        logger.info(f"Starting DEEP sold detection for {num_posts} sold items")
+        
+        # Reset counter
+        self.absolute_post_counter = 0
+        
+        sold_items_found = []
+        current_container = 0
+        posts_processed = 0
+        scroll_attempts = 0
+        max_scrolls = 25
+        max_posts_to_check = num_posts * 15
+        
+        await self.close_any_modals()
+        
+        while len(sold_items_found) < num_posts and posts_processed < max_posts_to_check:
+            try:
+                all_containers = await self.page.locator('[role="article"]').all()
+                
+                if current_container >= len(all_containers):
+                    logger.info(f"Need more containers (checked {posts_processed} posts, "
+                              f"found {len(sold_items_found)}/{num_posts} sold)")
+                    
+                    if scroll_attempts >= max_scrolls:
+                        break
+                    
+                    await self.page.keyboard.press('End')
+                    await asyncio.sleep(3)
+                    scroll_attempts += 1
+                    continue
+                
+                container = all_containers[current_container]
+                
+                try:
+                    html_content = await container.inner_html(timeout=2000)
+                    text_content = await container.text_content(timeout=1500) or ""
+                    
+                    if self._is_main_post_original_logic(text_content, len(html_content)):
+                        posts_processed += 1
+                        self.absolute_post_counter += 1
+                        
+                        # Get preview
+                        preview = ' '.join(text_content.split()[:20])[:100]
+                        
+                        logger.info(f"")
+                        logger.info(f"{'='*60}")
+                        logger.info(f"🔍 DEEP SCAN: POST #{self.absolute_post_counter} (container {current_container + 1})")
+                        logger.info(f"📝 Preview: {preview}...")
+                        logger.info(f"📊 Progress: Found {len(sold_items_found)}/{num_posts} sold items")
+                        logger.info(f"{'='*60}")
+                        
+                        # Visual highlight if enabled
+                        if self.visual_highlight:
+                            await self.highlight_element(container)
+                        
+                        # Process with deep analysis
+                        post_data, boundary_index = await self.process_post_with_deep_sold_analysis(
+                            all_containers,
+                            current_container,
+                            posts_processed
+                        )
+                        
+                        if post_data:
+                            sold_analysis = post_data.get('sold_analysis', {})
+                            
+                            if sold_analysis.get('is_sold', False):
+                                sold_items_found.append(post_data)
+                                confidence = sold_analysis.get('confidence', 0)
+                                method = sold_analysis.get('sale_method', 'unknown')
+                                
+                                if sold_analysis.get('would_be_missed_by_search'):
+                                    logger.success(f"💎 HIDDEN SOLD ITEM #{len(sold_items_found)} FOUND! "
+                                                 f"(Post #{self.absolute_post_counter})")
+                                    logger.info(f"   This sale would be MISSED by Facebook search!")
+                                else:
+                                    logger.success(f"✅ SOLD ITEM #{len(sold_items_found)} FOUND "
+                                                 f"(Post #{self.absolute_post_counter})")
+                                
+                                self.print_enhanced_post_summary(post_data, self.absolute_post_counter)
+                                
+                                self.posts_data = sold_items_found.copy()
+                                
+                                if len(sold_items_found) % 2 == 0:
+                                    await self.auto_save(sold_items_found)
+                            else:
+                                confidence = sold_analysis.get('confidence', 0)
+                                logger.info(f"   ❌ Not sold (confidence: {confidence}%) - continuing...")
+                        
+                        current_container = max(boundary_index, current_container + 1)
+                        scroll_attempts = 0
+                    else:
+                        current_container += 1
+                        
+                except Exception as e:
+                    logger.warning(f"Error processing container {current_container + 1}: {str(e)[:50]}")
+                    current_container += 1
+                    
+            except Exception as e:
+                logger.error(f"Major error: {str(e)[:100]}")
+                current_container += 1
+        
+        self.posts_data = sold_items_found
+        
+        logger.info(f"")
+        logger.info(f"{'='*60}")
+        logger.success(f"🏁 Deep detection complete!")
+        logger.info(f"📊 Final Stats:")
+        logger.info(f"   • Total posts scanned: {self.absolute_post_counter}")
+        logger.info(f"   • Sold items found: {len(sold_items_found)}/{num_posts}")
+        logger.info(f"{'='*60}")
+        
+        return sold_items_found
+
+    async def process_post_with_deep_sold_analysis(self, containers, main_post_index, post_number):
+        """Process post with DEEP analysis of comments for sale confirmation"""
+        
+        logger.debug(f"Deep analysis of post {post_number} at index {main_post_index}")
+        
+        try:
+            # First get the complete thread (post + all comments)
+            boundary_index = await self.find_post_boundary(containers, main_post_index)
+            thread_containers = containers[main_post_index:boundary_index]
+            thread_size = len(thread_containers)
+            
+            logger.debug(f"Complete thread: {thread_size} containers")
+            
+            # Extract main post data
+            main_container = thread_containers[0]
+            comment_containers = thread_containers[1:]
+            
+            # Force load if needed
+            try:
+                html_size = len(await main_container.inner_html(timeout=3000))
+                if html_size < 35000:
+                    await self.force_load_post_content(main_container)
+            except:
+                pass
+            
+            # Extract main post
+            post_data = await asyncio.wait_for(
+                self.extract_post_data_improved_fixed(main_container, post_number),
+                timeout=15.0
+            )
+            
+            if not post_data:
+                return None, boundary_index
+            
+            # Process ALL comments for deep analysis
+            if comment_containers:
+                logger.debug(f"Deep-scanning {len(comment_containers)} comment containers")
+                comment_container_info_list = []
+                for container in comment_containers:
+                    comment_container_info_list.append({'container': container})
+                
+                # For deep detection, we want ALL comments
+                await self.process_complete_comment_thread(
+                    post_data, 
+                    comment_container_info_list,
+                    max_comments=100  # High limit for deep analysis
+                )
+            
+            # Call the enhanced analyze_sold_status with deep_mode=True
+            sold_analysis = self.sold_detector.analyze_sold_status(post_data, deep_mode=True)
+            post_data['sold_analysis'] = sold_analysis
+            
+            # Enhanced logging for deep detection findings
+            if sold_analysis['is_sold']:
+                method = sold_analysis['sale_method']
+                
+                # Special highlighting for sales Facebook would miss
+                if sold_analysis.get('would_be_missed_by_search', False):
+                    logger.info(f"   💎 HIDDEN SALE FOUND - Facebook search would miss this!")
+                    logger.info(f"   This sale was confirmed only in comments, not the main post")
+                elif method == 'comments':
+                    logger.info(f"   💎 COMMENT-CONFIRMED SALE DETECTED")
+                elif method == 'both':
+                    logger.info(f"   ✅ Sale confirmed in both post and comments")
+                else:
+                    logger.info(f"   ✅ Sale confirmed in main post")
+                
+                # Show what made us detect this as sold
+                if sold_analysis.get('sold_indicators'):
+                    top_indicators = sold_analysis['sold_indicators'][:3]
+                    logger.debug(f"   Key indicators: {', '.join(top_indicators)}")
+            
+            return post_data, boundary_index
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Deep analysis timed out for post {post_number}")
+            return None, boundary_index
+        except Exception as e:
+            logger.error(f"Error in deep analysis for post {post_number}: {str(e)[:100]}")
+            return None, boundary_index
 
 
     ###^ 2.1 - FORCE LOADING HELPERS
@@ -1441,7 +1684,6 @@ class FacebookGroupScraper:
         
         return is_valid
 
-    # Alternative: Check for loaded content before processing
     async def wait_for_post_content(self, post_element, max_wait=10):
         """Wait for a post element to load real content"""
         print(f"      ⏳ Waiting for content to load...")
@@ -1633,6 +1875,43 @@ class FacebookGroupScraper:
         
         return False
     
+    async def highlight_element(self, element, duration=2):
+        """Visually highlight an element in the browser"""
+        if not self.visual_highlight:
+            return
+            
+        try:
+            # Scroll element into view first
+            await element.scroll_into_view_if_needed()
+            
+            # Add a red border and yellow background using JavaScript
+            await element.evaluate('''
+                (element) => {
+                    // Store original styles
+                    const originalBorder = element.style.border;
+                    const originalBackground = element.style.backgroundColor;
+                    const originalBoxShadow = element.style.boxShadow;
+                    
+                    // Apply highlight styles
+                    element.style.border = '3px solid red';
+                    element.style.backgroundColor = 'rgba(255, 255, 0, 0.3)';
+                    element.style.boxShadow = '0 0 20px rgba(255, 0, 0, 0.5)';
+                    
+                    // Remove highlight after duration
+                    setTimeout(() => {
+                        element.style.border = originalBorder;
+                        element.style.backgroundColor = originalBackground;
+                        element.style.boxShadow = originalBoxShadow;
+                    }, ''' + str(duration * 1000) + ''');
+                }
+            ''')
+            
+            # Brief pause to let the highlight be visible
+            await asyncio.sleep(0.5)
+            
+        except Exception as e:
+            logger.debug(f"Could not highlight element: {str(e)[:50]}")
+
     
     ###^ EXTRACTION METHODS - POST DATA & TEXT    
     
@@ -2419,7 +2698,44 @@ class FacebookGroupScraper:
                 print(f"   💰 Price: {sale_info.get('price')}")
             if sale_info.get('items'):
                 print(f"   🎯 Items: {', '.join(sale_info.get('items', [])[:3])}")
-            
+
+    def print_enhanced_post_summary(self, post_data, absolute_num):
+        """Print enhanced summary with consistent format"""
+        
+        # Main post text (first 100 chars)
+        text = post_data.get('text', '')[:100]
+        if len(post_data.get('text', '')) > 100:
+            text += "..."
+        
+        # Author
+        author = post_data.get('author', 'Unknown')[:30]
+        
+        # Images and comments
+        images = post_data.get('image_count', 0)
+        comments = post_data.get('comment_count', 0)
+        
+        # Print formatted summary
+        print(f"   📋 Post #{absolute_num} Summary:")
+        print(f"   📝 Text: {text}")
+        print(f"   👤 Author: {author}")
+        print(f"   📷 Images: {images} | 💬 Comments: {comments}")
+        
+        # If it's a sale post, show price
+        sale_info = post_data.get('sale_info')
+        if sale_info and sale_info.get('price'):
+            print(f"   💰 Price: {sale_info.get('price')}")
+        
+        # If sold detection is active
+        sold_analysis = post_data.get('sold_analysis')
+        if sold_analysis and sold_analysis.get('is_sold'):
+            confidence = sold_analysis.get('confidence', 0)
+            method = sold_analysis.get('sale_method', 'unknown')
+            print(f"   🏷️ SOLD: {confidence}% confidence via {method}")
+            if sold_analysis.get('would_be_missed_by_search'):
+                print(f"   💎 Hidden sale - Facebook search would miss this!")
+        
+        print("")  # Blank line for readability
+
 
     ###^ 5- CLEANUP AND SAVE FUNCTIONS
     
@@ -2658,8 +2974,40 @@ def start_browser_with_debugging():
         print("❌ Could not find Chrome or Edge")
         return False
 
+def prompt_select_groups(groups):
+    """
+    Show a numbered list of group names and return a list of selected group dicts.
+    Accepts: single number (e.g., '2'), comma-separated (e.g., '1,3'), or 'a' for all.
+    """
+    if not groups:
+        print("No Facebook groups configured in resources/fb_groups.py")
+        return []
+
+    print("\n📋 Available Facebook Groups:")
+    for i, g in enumerate(groups, start=1):
+        print(f"  {i}. {g['group_name']}  ({g['group_id']})")
+
+    raw = input("\nChoose group(s) [number, numbers comma-separated, or 'a' for all]: ").strip().lower()
+    if raw == "a":
+        return groups
+
+    # parse indices
+    try:
+        idxs = [int(x) for x in raw.split(",") if x.strip()]
+        selected = []
+        for idx in idxs:
+            if 1 <= idx <= len(groups):
+                selected.append(groups[idx - 1])
+            else:
+                print(f"  ⚠️ Skipping out-of-range index: {idx}")
+        return selected
+    except ValueError:
+        print("  ⚠️ Invalid input. Using the first group as default.")
+        return [groups[0]]
+
+
 async def main():
-    """Main function with sold items detection"""
+    """Main function with visual highlighting option"""
     print("\n" + "=" * 60)
     print("🎯 FACEBOOK GROUP SCRAPER - GI JOE & COLLECTIBLES")
     print("🔌 Uses existing browser session - no login required!")
@@ -2684,85 +3032,111 @@ async def main():
         print("\nAnd that you're logged into Facebook")
         input("\nPress Enter to continue...")
     
-    # UPDATED: Post filtering options with sold items
+    # Post filtering options with new option 5
     print("\n🏷️ Post Filtering Options:")
     print("1. All posts (default)")
     print("2. Sale posts only")
     print("3. Available sale posts only (exclude sold items)")
-    print("4. SOLD ITEMS ONLY (market research mode)")  # NEW
-    
-    filter_choice = input("\nFiltering choice (1-4): ").strip()
-    
+    print("4. SOLD ITEMS ONLY (Facebook search - posts marked 'sold')")
+    print("5. SOLD ITEMS ONLY (Deep detection - finds sales confirmed in comments)")
+
+    filter_choice = input("\nFiltering choice (1-5): ").strip()
+
     if filter_choice == '2':
         sale_posts_only = True
         include_sold = True
         sold_items_only = False
+        use_deep_sold_detection = False
         print("✅ Will scrape SALE POSTS ONLY (including sold items)")
+        
     elif filter_choice == '3':
         sale_posts_only = True
         include_sold = False
         sold_items_only = False
+        use_deep_sold_detection = False
         print("✅ Will scrape AVAILABLE SALE POSTS ONLY (excluding sold)")
-    elif filter_choice == '4':  # NEW
-        sale_posts_only = False  # We'll detect sales internally
+        
+    elif filter_choice == '4':
+        # Facebook search already filters for 'sold'
+        sale_posts_only = False
         include_sold = True
         sold_items_only = True
-        print("✅ Will scrape SOLD ITEMS ONLY (market research mode)")
-        print("ℹ️ This will analyze both posts and comments to identify completed sales")
+        use_deep_sold_detection = False
+        print("✅ Will scrape SOLD ITEMS from Facebook search (posts marked 'sold')")
+        print("ℹ️ Using Facebook's 'sold' search filter")
+        
+    elif filter_choice == '5':
+        # NEW: Deep detection mode - scan regular feed for comment-confirmed sales
+        sale_posts_only = False
+        include_sold = True
+        sold_items_only = False  # Don't use Facebook search
+        use_deep_sold_detection = True
+        print("✅ Will use DEEP SOLD DETECTION (analyzes posts + comments)")
+        print("🔍 This finds sales confirmed in comments that Facebook search might miss")
+        print("📊 Perfect for comprehensive market research")
+        
     else:
         sale_posts_only = False
         include_sold = True
         sold_items_only = False
+        use_deep_sold_detection = False
         print("ℹ️ Will scrape ALL posts")
     
-    # Ask about downloading images - DEFAULT TO YES
+    # Ask about visual highlighting
+    print("\n🎨 Visual Options:")
+    highlight = input("Enable visual highlighting of posts being processed? (y/n, default=n): ").strip().lower()
+    visual_highlight = highlight == 'y'
+    
+    if visual_highlight:
+        print("✅ Visual highlighting enabled - watch the browser to see posts being processed!")
+        print("   Each post will be highlighted with a red border and yellow background")
+    else:
+        print("ℹ️ Visual highlighting disabled (better performance)")
+    
+    # Ask about downloading images
     download = input("\n📷 Download images? (y/n, default=y): ").strip().lower()
-    download_images = download != 'n'  # Default to True unless explicitly 'n'
-
+    download_images = download != 'n'
+    
     if download_images:
         print("✅ Will download images to local folder")
-        try:
-            import aiohttp
-            import aiofiles
-        except ImportError:
-            print("📦 Installing required packages for image downloads...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "aiohttp", "aiofiles"])
-            print("✅ Packages installed")
+        # ... [existing image download setup] ...
     else:
         print("ℹ️ Will only save image URLs (not downloading)")
-
-    # Ask about autonomous operation - DEFAULT TO YES
+    
+    # Ask about autonomous operation
     autonomous = input("\n🤖 Run autonomously without user prompts? (y/n, default=y): ").strip().lower()
-    autonomous_mode = autonomous != 'n'  # Default to True unless explicitly 'n'
-
+    autonomous_mode = autonomous != 'n'
+    
     if autonomous_mode:
         print("✅ Autonomous mode enabled - will run without user interaction")
     else:
         print("ℹ️ Interactive mode - will ask for confirmation if needed")
     
-    # Create scraper with sold detection
+    # Create scraper with all options including visual highlighting
     scraper = FacebookGroupScraper(
         download_images=download_images,
         sale_posts_only=sale_posts_only,
         include_sold=include_sold,
-        sold_items_only=sold_items_only
+        sold_items_only=sold_items_only,
+        use_deep_sold_detection=use_deep_sold_detection if 'use_deep_sold_detection' in locals() else False,
+        visual_highlight=visual_highlight  # NEW parameter
     )
     
     try:
         # Connect to browser
         if await scraper.connect_to_existing_browser():
             
-            # Ask which group to scrape
-            print(f"\n🌐 Default group: {DEFAULT_GROUP} (GI Joe ARAH)")
-            use_default = input("Use default group? (y/n): ").strip().lower()
-            
-            if use_default == 'y':
-                group_id = DEFAULT_GROUP
-            else:
-                group_id = input("Enter group ID: ").strip() or DEFAULT_GROUP
-            
-            # Navigate to group
-            await scraper.navigate_to_group(group_id)
+            # Ask which group(s) to scrape using the configured list
+            selected_groups = prompt_select_groups(fb_groups)
+            if not selected_groups:
+                print("No groups selected. Exiting.")
+                return
+
+            # Navigate to (and later scrape) each selected group in order
+            for grp in selected_groups:
+                group_id = grp["group_id"]
+                print(f"\n🌐 Selected group: {grp['group_name']} ({group_id})")
+                await scraper.navigate_to_group(group_id)
             
             # Skip diagnosis for filtering modes to save time
             if filter_choice == '1':  # Only for "all posts" mode
@@ -2788,35 +3162,42 @@ async def main():
             print("Enhanced version with sold items detection.\n")
             
             # Calculate timeout based on mode
-            if sold_items_only:
-                # Longest timeout since we need to analyze comments deeply
-                base_timeout = max(400, num_posts * 40)  # 40 seconds per post
+            if use_deep_sold_detection:
+                # Longest timeout - need to analyze comments deeply
+                base_timeout = max(500, num_posts * 50)  # 50 seconds per sold item to find
+            elif sold_items_only:
+                # Facebook search - simpler
+                base_timeout = max(300, num_posts * 30)
             elif sale_posts_only:
                 base_timeout = max(300, num_posts * 30)
             else:
                 base_timeout = max(240, num_posts * 25)
-            
-            # Scraping with sold detection
+                        
+            # Scraping with appropriate method
             all_posts = []
             attempt = 1
-            max_retries = 3 if sold_items_only else 2
+            max_retries = 3 if (sold_items_only or use_deep_sold_detection) else 2
             remaining_posts = num_posts
             
             while len(all_posts) < num_posts and attempt <= max_retries:
                 try:
-                    if sold_items_only:
-                        print(f"📡 Attempt {attempt}/{max_retries}: Searching for {remaining_posts} sold items (timeout: {base_timeout}s)")
-                    else:
-                        print(f"📡 Attempt {attempt}/{max_retries}: Scraping {remaining_posts} posts (timeout: {base_timeout}s)")
-                    
-                    # Use enhanced scraping method for sold detection
-                    if sold_items_only:
-                        # Facebook search already filtered for 'sold' - just scrape sequentially
+                    if use_deep_sold_detection:
+                        # Option 5: Deep detection on regular group feed
+                        print(f"🔍 Attempt {attempt}/{max_retries}: Deep-scanning for {remaining_posts} sold items (timeout: {base_timeout}s)")
+                        posts = await asyncio.wait_for(
+                            scraper.scrape_with_deep_sold_detection(remaining_posts),
+                            timeout=base_timeout
+                        )
+                    elif sold_items_only:
+                        # Option 4: Facebook search results
+                        print(f"📡 Attempt {attempt}/{max_retries}: Scraping {remaining_posts} posts from Facebook search (timeout: {base_timeout}s)")
                         posts = await asyncio.wait_for(
                             scraper.scrape_sold_items_from_search(remaining_posts),
                             timeout=base_timeout
                         )
                     else:
+                        # Options 1, 2, 3: Regular scraping
+                        print(f"📡 Attempt {attempt}/{max_retries}: Scraping {remaining_posts} posts (timeout: {base_timeout}s)")
                         posts = await asyncio.wait_for(
                             scraper.scrape_with_thread_boundary_detection(remaining_posts),
                             timeout=base_timeout
@@ -2824,8 +3205,15 @@ async def main():
                     
                     if posts:
                         all_posts.extend(posts)
-                        if sold_items_only:
-                            print(f"✅ Found {len(posts)} sold items in attempt {attempt}")
+                        if use_deep_sold_detection:
+                            print(f"✅ Found {len(posts)} sold items via deep detection in attempt {attempt}")
+                            # Show how many were comment-confirmed
+                            comment_sales = sum(1 for p in posts 
+                                            if p.get('sold_analysis', {}).get('sale_method') in ['comments', 'both'])
+                            if comment_sales > 0:
+                                print(f"   💎 {comment_sales} were confirmed via comments (Facebook search would miss these!)")
+                        elif sold_items_only:
+                            print(f"✅ Got {len(posts)} sold posts from Facebook search in attempt {attempt}")
                         else:
                             print(f"✅ Got {len(posts)} posts in attempt {attempt}")
                         break
@@ -2841,7 +3229,7 @@ async def main():
                         remaining_posts = num_posts - len(all_posts)
                         print(f"🤖 Autonomous retry: Attempting {remaining_posts} more posts...")
                         attempt += 1
-                        base_timeout = max(300, remaining_posts * 30)
+                        base_timeout = max(300, remaining_posts * 40)
                         continue
                     else:
                         break
