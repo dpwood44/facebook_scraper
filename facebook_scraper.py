@@ -276,15 +276,17 @@ class FacebookGroupScraper:
     ###^ 2 - MAIN POST SCRAPING METHODS
 
     async def process_post_with_complete_thread(self, containers, main_post_index, post_number):
-        """Process a main post and ALL its comments - with enhanced logging"""
+        """Process a main post and ALL its comments - with fixed extraction and validation"""
         
         # Increment absolute counter
         self.absolute_post_counter += 1
         absolute_num = self.absolute_post_counter
         
-        # Get preview of post text first
+        # Use the specific container at main_post_index
+        main_container = containers[main_post_index]
+        
+        # Get preview of post text from the CORRECT container
         try:
-            main_container = containers[main_post_index]
             preview_text = await main_container.text_content(timeout=2000) or ""
             preview_text = ' '.join(preview_text.split()[:20])  # First 20 words
             if len(preview_text) > 100:
@@ -311,10 +313,10 @@ class FacebookGroupScraper:
             thread_containers = containers[main_post_index:boundary_index]
             thread_size = len(thread_containers)
             
-            logger.debug(f"Thread size: {thread_size} containers (post + {thread_size-1} comment containers)")
+            logger.debug(f"Complete thread: containers {main_post_index+1} to {boundary_index} ({thread_size} containers)")
             
-            # The first container is the main post
-            main_container = thread_containers[0]
+            # Use the first container in thread_containers
+            main_container_for_extraction = thread_containers[0]  
             comment_containers = thread_containers[1:]
             
             # Adjust processing strategy based on thread size
@@ -323,19 +325,43 @@ class FacebookGroupScraper:
             
             # Force load main post if needed
             try:
-                html_size = len(await main_container.inner_html(timeout=3000))
+                html_size = len(await main_container_for_extraction.inner_html(timeout=3000))
                 if html_size < 35000:
                     logger.debug("Force loading main post...")
-                    await self.force_load_post_content(main_container)
+                    await self.force_load_post_content(main_container_for_extraction)
             except Exception as e:
                 logger.warning(f"Could not check/load main post size: {str(e)[:50]}")
             
             # Extract main post data with appropriate timeout
             main_post_timeout = 20.0 if thread_size > 15 else 15.0
             post_data = await asyncio.wait_for(
-                self.extract_post_data_improved_fixed(main_container, post_number),
+                self.extract_post_data_improved_fixed(main_container_for_extraction, post_number),
                 timeout=main_post_timeout
             )
+            
+            # IMPROVED VALIDATION: Check if the extracted content is reasonable
+            # Instead of comparing preview with extracted text directly
+            if post_data and post_data.get('text'):
+                # Extract just the content part from preview (skip author/time metadata)
+                preview_parts = preview_text.split('·')
+                if len(preview_parts) > 2:  # Has author · time · content structure
+                    content_preview = preview_parts[-1].strip()[:30]
+                else:
+                    content_preview = preview_text[:30]
+                
+                extracted_preview = post_data['text'][:30]
+                
+                # Only flag mismatch if the content is completely different
+                # (not just metadata vs content comparison)
+                if (content_preview and extracted_preview and 
+                    content_preview.lower() not in extracted_preview.lower() and 
+                    extracted_preview.lower() not in content_preview.lower() and
+                    not any(word in extracted_preview.lower() for word in content_preview.lower().split()[:3])):
+                    
+                    logger.warning(f"⚠️ Potential extraction mismatch detected")
+                    logger.debug(f"   Content preview: {content_preview}")
+                    logger.debug(f"   Extracted: {extracted_preview}")
+                    # Try re-extraction but don't fail if it doesn't match perfectly
             
             logger.success(f"Extracted main post data for post {post_number}")
             
@@ -347,12 +373,7 @@ class FacebookGroupScraper:
                     comment_container_info_list.append({'container': container})
                 
                 # Dynamic comment limit based on thread size
-                if thread_size > 25:
-                    max_comments = min(50, thread_size)
-                elif thread_size > 15:
-                    max_comments = 75
-                else:
-                    max_comments = 100
+                max_comments = min(100, thread_size * 2)  # More generous limit
                 
                 logger.debug(f"Max comments for this thread: {max_comments}")
                 
@@ -365,103 +386,126 @@ class FacebookGroupScraper:
             return post_data, boundary_index
             
         except asyncio.TimeoutError:
-            logger.error(f"Thread processing timed out for {thread_size} containers")
+            logger.error(f"Thread processing timed out for post #{absolute_num}")
             if 'post_data' in locals():
-                return post_data, boundary_index
-            return None, boundary_index
+                return post_data, boundary_index if 'boundary_index' in locals() else main_post_index + 1
+            return None, boundary_index if 'boundary_index' in locals() else main_post_index + 1
             
         except Exception as e:
             logger.error(f"Error processing thread: {str(e)[:100]}")
-            return None, boundary_index
-        
+            return None, boundary_index if 'boundary_index' in locals() else main_post_index + 1
+
     async def scrape_with_thread_boundary_detection(self, num_posts=10):
-        """Main scraping function - with comprehensive logging"""
-        logger.info(f"Starting scraping of {num_posts} posts with thread boundary detection")
+        """Main scraping function with better post detection"""
+        logger.info(f"Starting scraping of {num_posts} posts")
         
         # Reset counter for new scraping session
         self.absolute_post_counter = 0
         
         posts = []
         scroll_attempts = 0
-        max_scrolls = 15
+        max_scrolls = 20  # Increased to handle more scrolling
         container_position = 0
+        containers_checked = 0  # Track how many we've looked at
         
         await self.close_any_modals()
         
         while len(posts) < num_posts and scroll_attempts < max_scrolls:
             try:
                 all_containers = await self.page.locator('[role="article"]').all()
-                remaining_containers = all_containers[container_position:]
+                total_containers = len(all_containers)
                 
-                if not remaining_containers:
-                    logger.debug("No new containers, scrolling for more...")
+                logger.debug(f"Total containers available: {total_containers}, starting from position {container_position}")
+                
+                # If we've checked all current containers, scroll for more
+                if container_position >= total_containers:
+                    logger.info(f"Reached end of current containers ({total_containers}), scrolling for more...")
                     await self.page.keyboard.press('End')
                     await asyncio.sleep(3)
                     scroll_attempts += 1
                     continue
                 
-                # Find next main post
-                next_main_post_index = None
-                for i, container in enumerate(remaining_containers[:15]):
+                # Check containers one by one instead of in batches
+                found_post = False
+                for i in range(container_position, min(container_position + 20, total_containers)):
+                    containers_checked += 1
+                    container = all_containers[i]
+                    
                     try:
-                        html_content = await container.inner_html(timeout=1500)
-                        text_content = await container.text_content(timeout=1200) or ""
+                        # More lenient timeout for checking
+                        html_content = await container.inner_html(timeout=2000)
+                        text_content = await container.text_content(timeout=1500) or ""
+                        html_size = len(html_content)
                         
-                        if self.is_main_post_container(text_content, len(html_content)):
-                            next_main_post_index = container_position + i
+                        # Log what we're checking
+                        preview = ' '.join(text_content.split()[:10])[:50]
+                        logger.debug(f"Checking container {i+1}: {html_size} bytes, preview: {preview}...")
+                        
+                        # Check if it's a loading placeholder
+                        if 'aria-label="Loading"' in html_content or 'role="status"' in html_content:
+                            logger.debug(f"Container {i+1} is a loading placeholder, skipping")
+                            continue
+                        
+                        # Check if this is a main post
+                        if self.is_main_post_container(text_content, html_size):
+                            logger.info(f"Found main post at container {i+1}")
                             
-                            # Quick preview for debugging
-                            preview = ' '.join(text_content.split()[:10])
-                            logger.debug(f"Found main post at container {next_main_post_index + 1}: {preview[:50]}...")
+                            # Process this post
+                            post_data, boundary_index = await self.process_post_with_complete_thread(
+                                all_containers, 
+                                i,
+                                len(posts) + 1
+                            )
+                            
+                            if post_data and self.validate_main_post_data(post_data):
+                                posts.append(post_data)
+                                logger.success(f"✅ Successfully scraped post #{self.absolute_post_counter} -> Saved as post {len(posts)}/{num_posts}")
+                                
+                                # Show key details
+                                self.print_enhanced_post_summary(post_data, self.absolute_post_counter)
+                                
+                                self.posts_data = posts.copy()
+                                
+                                if len(posts) % 3 == 0:
+                                    logger.info(f"Auto-saving progress at {len(posts)} posts")
+                                    await self.auto_save(posts)
+                            else:
+                                logger.warning(f"❌ Post #{self.absolute_post_counter} failed validation")
+                            
+                            # Move position to after this post's thread
+                            container_position = boundary_index
+                            found_post = True
+                            scroll_attempts = 0  # Reset scroll attempts on success
                             break
+                        else:
+                            logger.debug(f"Container {i+1} is not a main post")
                             
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"Error checking container {i+1}: {str(e)[:50]}")
                         continue
                 
-                if next_main_post_index is None:
-                    logger.debug("No main post found, scrolling...")
-                    await self.page.keyboard.press('End')
-                    await asyncio.sleep(3)
-                    scroll_attempts += 1
-                    container_position += 5
-                    continue
-                
-                # Process the post
-                post_data, boundary_index = await self.process_post_with_complete_thread(
-                    all_containers, 
-                    next_main_post_index,
-                    len(posts) + 1
-                )
-                
-                if post_data and self.validate_main_post_data(post_data):
-                    posts.append(post_data)
-                    logger.success(f"✅ Successfully scraped post #{self.absolute_post_counter} -> Saved as post {len(posts)}/{num_posts}")
+                # If we didn't find a post in this batch, move forward and/or scroll
+                if not found_post:
+                    container_position = min(container_position + 10, total_containers)
+                    logger.debug(f"No posts found in batch, advancing to position {container_position}")
                     
-                    # Show key details
-                    self.print_enhanced_post_summary(post_data, self.absolute_post_counter)
+                    # If we're near the end, scroll for more
+                    if container_position >= total_containers - 5:
+                        logger.info("Near end of containers, scrolling for more...")
+                        await self.page.keyboard.press('End')
+                        await asyncio.sleep(3)
+                        scroll_attempts += 1
                     
-                    self.posts_data = posts.copy()
-                    
-                    if len(posts) % 3 == 0:
-                        logger.info(f"Auto-saving progress at {len(posts)} posts")
-                        await self.auto_save(posts)
-                else:
-                    logger.warning(f"❌ Post #{self.absolute_post_counter} failed validation, skipping")
-                
-                # Move to next
-                container_position = boundary_index
-                scroll_attempts = 0
-                
             except Exception as e:
-                logger.error(f"Error in scraping: {str(e)[:100]}")
+                logger.error(f"Error in scraping loop: {str(e)[:100]}")
                 scroll_attempts += 1
-                container_position += 3
+                container_position += 5
                 continue
         
         self.posts_data = posts
         logger.info(f"Completed scraping: {len(posts)} valid posts from {self.absolute_post_counter} total processed")
+        logger.info(f"Checked {containers_checked} containers total")
         return posts
-
 
     async def scrape_with_sold_detection(self, num_posts=10):
         """Simplified sequential processing - just go through posts 1, 2, 3, 4..."""
@@ -1025,91 +1069,85 @@ class FacebookGroupScraper:
         return is_main_post
 
     def _is_main_post_original_logic(self, text_content, html_size):
-        """Your original main post detection logic (unchanged)"""
-        # SALE INDICATORS should override comment signals (highest priority)
-        strong_sale_indicators = [
-            '$' in text_content and any(word in text_content.lower() for word in ['shipped', 'obo', 'firm', 'sold']),
-            any(phrase in text_content.lower() for phrase in ['for sale', 'fs:', 'wts:', 'price drop']),
-            text_content.count('$') > 0 and len(text_content) > 80,  # Price with substantial text
+        """More lenient main post detection"""
+        
+        # Filter out obvious non-posts
+        non_post_indicators = [
+            'aria-label="Loading"',
+            'Unread Chats',
+            'Number of unread notifications',
+            'ChatsAllHas new content',
+            'CommunitiesHas ne'
         ]
         
-        # If it has strong sale indicators, it's definitely a main post regardless of other signals
-        if any(strong_sale_indicators):
-            logger.debug(f"SALE POST DETECTED: {text_content[:50]}...")
-            return True
-        
-        # STRONG comment indicators (but can be overridden by sale indicators above)
-        strong_comment_indicators = [
-            text_content.endswith('LikeReply') and '$' not in text_content,  # Only if no price
-            text_content.endswith('Reply') and len(text_content) < 100,
-            text_content.endswith('Like') and len(text_content) < 50,
-            'LikeCommentSend' in text_content and len(text_content) < 150 and '$' not in text_content,
-            text_content.startswith('Following.') and 'LikeReply' in text_content,
-            
-            # Very short responses without sale context
-            (len(text_content.split()) < 8 and 
-            any(pattern in text_content.lower() for pattern in [
-                'nice', 'cool', 'awesome', 'great', 'beautiful', 'sweet', 'yes', 'no',
-                'thanks', 'thank you', 'lol', 'haha', 'wow', 'love it', 'agreed'
-            ]) and '$' not in text_content)
-        ]
-        
-        # Apply strong comment indicators only if no sale context
-        if any(strong_comment_indicators):
-            logger.debug(f"STRONG COMMENT SIGNAL: {text_content[:50]}...")
+        if any(indicator in text_content for indicator in non_post_indicators):
             return False
         
-        # Main post indicators
-        main_post_indicators = [
-            # Size-based indicators
-            html_size > 40000,  
-            len(text_content) > 150,  
+        # Too small to be a real post
+        if html_size < 1000 or len(text_content.strip()) < 10:
+            return False
+        
+        # Check for loading states
+        if html_size < 3000 and len(text_content) == 0:
+            return False  # Likely a loading placeholder
+        
+        # POSITIVE INDICATORS - any of these means it's likely a main post
+        positive_indicators = [
+            # Price/sale indicators
+            '$' in text_content,
+            any(phrase in text_content.lower() for phrase in ['for sale', 'fs:', 'wts:', 'selling']),
             
-            # Facebook-specific patterns
+            # Facebook post structure
             'Shared with Private group' in text_content,
-            any(title in text_content for title in ['All-star contributor', 'Top contributor', 'Rising contributor']),
+            '·' in text_content and any(time in text_content for time in ['ago', 'at', 'AM', 'PM']),
             
-            # Time patterns (but not ending with reply actions)
-            (any(pattern in text_content for pattern in ['h ·', 'd ·', 'min ·', 'week ·']) 
-            and not any(end in text_content for end in ['LikeReply', 'LikeCommentSend'])),
+            # Author patterns
+            any(word in text_content for word in ['Follow', 'Admin', 'Moderator']),
             
-            # Collectible/sale patterns
-            any(keyword in text_content.lower() for keyword in [
-                'paypal', 'shipping', 'complete', 'loose', 'moc', 'mip', 'iso',
-                'condition', 'vintage', 'collection'
-            ]),
+            # Size indicators
+            html_size > 30000,
+            len(text_content) > 100,
             
-            # Structural complexity
-            text_content.count('\n') > 5,
+            # Has images or links (based on text patterns)
+            'See more' in text_content,
+            '… See more' in text_content,
         ]
         
-        # Regular comment indicators
-        regular_comment_indicators = [
-            html_size < 20000 and len(text_content) < 120,
-            len(text_content) < 40,
-            text_content.count('?') > 0 and len(text_content) < 100,
+        # NEGATIVE INDICATORS - strong signals it's NOT a main post
+        negative_indicators = [
+            # Comment endings
+            text_content.endswith('LikeReply'),
+            text_content.endswith('Reply') and len(text_content) < 50,
+            text_content.endswith('Like') and len(text_content) < 30,
+            
+            # Too short
+            len(text_content) < 20 and '$' not in text_content,
         ]
         
-        # Decision logic
-        main_post_score = sum(1 for indicator in main_post_indicators if indicator)
-        comment_score = sum(1 for indicator in regular_comment_indicators if indicator)
+        # Count positive indicators
+        positive_count = sum(1 for indicator in positive_indicators if indicator)
+        negative_count = sum(1 for indicator in negative_indicators if indicator)
         
-        if main_post_score >= 2:
+        # Decision logic - be more lenient
+        if positive_count >= 2:
             return True
-        elif comment_score >= 2 and main_post_score == 0:
+        elif negative_count >= 2:
             return False
-        elif html_size > 25000:  # Size-based fallback
+        elif positive_count >= 1 and negative_count == 0:
             return True
-        elif html_size < 15000 and len(text_content) < 80:
-            return False
+        elif html_size > 20000:  # Large enough to likely be a post
+            return True
         else:
-            return len(text_content) > 60 or html_size > 20000
-        
+            # Default to false only for very small content
+            return html_size > 5000 or len(text_content) > 50
+
     async def find_post_boundary(self, containers, start_index):
-        """Look ahead to find post boundaries with enhanced handling for long comment threads"""
+        """Enhanced boundary detection with better validation"""
         
         # Look ahead further for posts that might have long comment threads
-        look_ahead_limit = min(len(containers), start_index + 35)  # Increased from 20 to 35
+        look_ahead_limit = min(len(containers), start_index + 35)
+        
+        logger.debug(f"Looking for boundary starting from container {start_index + 1}")
         
         for i in range(start_index + 1, look_ahead_limit):
             try:
@@ -1117,31 +1155,35 @@ class FacebookGroupScraper:
                 
                 # Quick check if this looks like a main post
                 try:
-                    html_content = await container.inner_html(timeout=800)  # Shorter timeout for boundary detection
+                    html_content = await container.inner_html(timeout=800)
                     text_content = await container.text_content(timeout=600) or ""
                     html_size = len(html_content)
                     
                     # Skip tiny placeholders
                     if html_size < 300:
+                        logger.debug(f"Container {i+1}: Too small ({html_size} bytes), skipping")
                         continue
+                    
+                    # Get a preview of this container for debugging
+                    preview = ' '.join(text_content.split()[:10])[:50]
                     
                     # If this looks like a main post, we found our boundary
                     if self.is_main_post_container(text_content, html_size):
-                        print(f"    Boundary found at container {i+1} (next main post)")
+                        logger.debug(f"Boundary found at container {i+1} (next main post: {preview}...)")
                         return i
+                    else:
+                        logger.debug(f"Container {i+1}: Not a main post ({html_size} bytes, preview: {preview}...)")
                         
-                except Exception:
-                    # If we can't check a container quickly, continue looking
+                except Exception as e:
+                    logger.debug(f"Container {i+1}: Error checking ({str(e)[:30]})")
                     continue
                     
             except Exception:
                 continue
         
         # If we didn't find a boundary within our look-ahead limit
-        print(f"    No boundary found in look-ahead range (checked {look_ahead_limit - start_index - 1} containers)")
+        logger.debug(f"No boundary found in look-ahead range (checked {look_ahead_limit - start_index - 1} containers)")
         return look_ahead_limit
-
-
 
     ###^ 2.3 - SALE POST DETECTION
 
@@ -1182,11 +1224,11 @@ class FacebookGroupScraper:
             'iso', 'in search of', 'looking for', 'wtb', 'want to buy',
             'wanted', 'need', 'seeking', 'anyone have', 'does anyone',
             'help me find', 'where can i', 'question', 'advice', 'opinion',
-            'thoughts', 'what do you think', 'should i', 'is this worth',
-            'just got', 'just arrived', 'mail call', 'collection update',
-            'haul', 'found at'
+        'thoughts', 'what do you think', 'should i', 'is this worth',
+        'just got', 'just arrived', 'mail call', 'collection update',
+        'haul', 'found at'
         ]
-        
+            
         logger.info(f"Sale detection patterns initialized")
 
     async def _verify_sale_filter_applied(self):
@@ -1211,7 +1253,6 @@ class FacebookGroupScraper:
         except Exception as e:
             logger.warning(f"Could not verify sale filter status: {e}")
             return False
-
 
     def is_sale_post(self, text_content):
         """Determine if a post is a sale post with confidence scoring"""
@@ -1273,7 +1314,7 @@ class FacebookGroupScraper:
             'reasons': reasons, 
             'price_found': price_found
         }
-    
+        
 
     ###^ 3 - COMMENT SCRAPING
 
@@ -1842,7 +1883,7 @@ class FacebookGroupScraper:
         except Exception as e:
             print(f"    Modal close error: {str(e)[:50]}")
             return False
- 
+
     async def close_any_modals(self):
         """Close any open post modals or popups"""
         try:
@@ -2575,7 +2616,7 @@ class FacebookGroupScraper:
         print("2. Look at the HTML structure to understand the layout") 
         print("3. Try manual browser inspection (F12) to compare")
         print("4. Consider if Facebook has changed their layout recently")
- 
+
     async def detailed_post_inspection(self):
         """Detailed inspection to understand post structure"""
         print("\n=== DETAILED POST INSPECTION ===")
@@ -2735,6 +2776,62 @@ class FacebookGroupScraper:
                 print(f"   💎 Hidden sale - Facebook search would miss this!")
         
         print("")  # Blank line for readability
+
+    async def debug_all_containers(self):
+        """Debug method to inspect all containers and show why they're filtered"""
+        logger.info("=" * 60)
+        logger.info("DEBUG: Inspecting all containers")
+        logger.info("=" * 60)
+        
+        all_containers = await self.page.locator('[role="article"]').all()
+        
+        for i, container in enumerate(all_containers[:20]):  # Check first 20
+            try:
+                html_content = await container.inner_html(timeout=2000)
+                text_content = await container.text_content(timeout=1500) or ""
+                html_size = len(html_content)
+                
+                # Get preview
+                preview = ' '.join(text_content.split()[:15])[:100]
+                
+                # Check if it's a main post
+                is_main = self.is_main_post_container(text_content, html_size)
+                
+                # Analyze why or why not
+                reasons = []
+                
+                # Check positive indicators
+                if '$' in text_content:
+                    reasons.append("✓ Has price")
+                if 'Shared with Private group' in text_content:
+                    reasons.append("✓ Has group marker")
+                if '·' in text_content:
+                    reasons.append("✓ Has separator")
+                if html_size > 30000:
+                    reasons.append(f"✓ Large HTML ({html_size})")
+                
+                # Check negative indicators
+                if 'aria-label="Loading"' in html_content:
+                    reasons.append("✗ Loading placeholder")
+                if text_content.endswith('LikeReply'):
+                    reasons.append("✗ Ends with LikeReply")
+                if html_size < 5000:
+                    reasons.append(f"✗ Small HTML ({html_size})")
+                
+                logger.info(f"Container {i+1}:")
+                logger.info(f"  Preview: {preview}")
+                logger.info(f"  Size: {html_size} bytes, {len(text_content)} chars")
+                logger.info(f"  Is Main Post: {is_main}")
+                logger.info(f"  Reasons: {', '.join(reasons) if reasons else 'None detected'}")
+                logger.info("")
+                
+            except Exception as e:
+                logger.info(f"Container {i+1}: Error - {str(e)[:50]}")
+                logger.info("")
+        
+        logger.info("=" * 60)
+        logger.info("End of debug inspection")
+        logger.info("=" * 60)
 
 
     ###^ 5- CLEANUP AND SAVE FUNCTIONS
@@ -2917,7 +3014,6 @@ class FacebookGroupScraper:
         logger.info("Cleanup complete - browser left open for your use")
 
 
-
 def start_browser_with_debugging():
     """Helper to start browser with remote debugging"""
     print("\n🚀 Starting Browser with Remote Debugging...")
@@ -3011,10 +3107,7 @@ async def main():
     print("\n" + "=" * 60)
     print("🎯 FACEBOOK GROUP SCRAPER - GI JOE & COLLECTIBLES")
     print("🔌 Uses existing browser session - no login required!")
-    print("=" * 60)
-    
-    # Default GI Joe group
-    DEFAULT_GROUP = "132930063463148"
+    print("=" * 60)    
     
     print("\nOptions:")
     print("1. 🔗 Use existing browser (you're already logged in)")
@@ -3140,7 +3233,14 @@ async def main():
             
             # Skip diagnosis for filtering modes to save time
             if filter_choice == '1':  # Only for "all posts" mode
-                await scraper.comprehensive_diagnosis()
+                print("\n🔍 Running container debug analysis...")
+                await scraper.debug_all_containers()
+                
+                # Ask if they want to continue after seeing debug
+                continue_after_debug = input("\nContinue with scraping? (y/n): ").strip().lower()
+                if continue_after_debug != 'y':
+                    print("Exiting after debug analysis.")
+                    return
             
             # How many posts?
             num = input("\nNumber of posts to scrape (default 10): ").strip()
