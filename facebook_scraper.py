@@ -395,29 +395,135 @@ class FacebookGroupScraper:
             logger.error(f"Error processing thread: {str(e)[:100]}")
             return None, boundary_index if 'boundary_index' in locals() else main_post_index + 1
 
+    def validate_main_post_data(self, post_data):
+        """UPDATED: Handle mixed content better and adjust classification override"""
+        if not post_data:
+            logger.debug("Post validation failed: No post data")
+            return False
+        
+        text = post_data.get('text', '')
+        author = post_data.get('author', '')
+        
+        logger.debug(f"VALIDATION DEBUG:")
+        logger.debug(f"  Text length: {len(text)} chars")
+        logger.debug(f"  Text preview: '{text[:100]}...' " if len(text) > 100 else f"  Text: '{text}'")
+        logger.debug(f"  Author: '{author}'")
+        logger.debug(f"  Images: {post_data.get('image_count', 0)}")
+        logger.debug(f"  Comments: {post_data.get('comment_count', 0)}")
+        
+        # IMPROVED: Classification with better mixed-content handling
+        if text:
+            classification = self._classify_by_structural_patterns(text)
+            logger.debug(f"  Classification: {classification['type']} ({classification['confidence']}%)")
+            
+            # ADJUSTED: More lenient classification override for mixed content
+            # Only reject if it's VERY clearly a pure comment (higher threshold)
+            if (classification['type'] == 'comment' and 
+                classification['confidence'] >= 95 and  # Raised threshold
+                len(text) < 150):  # AND it's short (pure comments are usually short)
+                
+                logger.debug(f"Post validation failed: Short pure comment ({classification['confidence']}%)")
+                return False
+        
+        # Check for strong sale post indicators that should override classification
+        is_strong_sale_post = False
+        if text:
+            sale_indicators = ['$', 'obo', 'shipped', 'sealed', 'package']
+            found_indicators = [ind for ind in sale_indicators if ind in text.lower()]
+            
+            # Strong sale posts should pass regardless of classification
+            if (len(found_indicators) >= 2 and len(text) > 100):
+                is_strong_sale_post = True
+                logger.debug(f"  Strong sale post detected: {found_indicators}")
+        
+        # VERY LENIENT validation criteria
+        has_text = bool(text.strip()) and len(text.strip()) > 15
+        has_author = bool(author.strip())
+        has_images = post_data.get('image_count', 0) > 0
+        has_comments = post_data.get('comment_count', 0) > 0
+        
+        # Special validation for sale posts
+        is_sale_post = False
+        if text:
+            sale_keywords = ['$', 'price', 'obo', 'shipped', 'paypal', 'venmo', 'for sale', 'selling']
+            found_sale_indicators = [ind for ind in sale_keywords if ind in text.lower()]
+            is_sale_post = len(found_sale_indicators) > 0
+        
+        logger.debug(f"  Validation criteria: text={has_text}, author={has_author}, images={has_images}, comments={has_comments}")
+        logger.debug(f"  Sale indicators: {found_sale_indicators if 'found_sale_indicators' in locals() else 'None'}")
+        logger.debug(f"  Strong sale post: {is_strong_sale_post}")
+        
+        # DECISION LOGIC: Multiple paths to pass validation
+        
+        # Path 1: Strong sale posts should always pass
+        if is_strong_sale_post:
+            logger.debug(f"  ✅ PASSED: Strong sale post override")
+            return True
+        
+        # Path 2: Sale posts with text should pass
+        if is_sale_post and has_text:
+            logger.debug(f"  ✅ PASSED: Sale post with text")
+            return True
+        
+        # Path 3: Posts with substantial content
+        if has_text and has_author and len(text) > 50:
+            logger.debug(f"  ✅ PASSED: Substantial content with author")
+            return True
+        
+        # Path 4: Posts with any quality indicators
+        quality_indicators = [has_text, has_author, has_images, has_comments]
+        quality_score = sum(quality_indicators)
+        
+        if quality_score >= 2:  # Need at least 2 quality indicators
+            logger.debug(f"  ✅ PASSED: Quality score {quality_score}/4")
+            return True
+        
+        # Default: Fail
+        logger.debug(f"  ❌ FAILED: Insufficient content (quality score: {quality_score}/4)")
+        return False
+
+    def force_validate_sale_posts(self, post_data):
+        """Emergency validation for posts that should clearly pass"""
+        if not post_data:
+            return False
+        
+        text = post_data.get('text', '').lower()
+        
+        # If it has price and sale indicators, force it to pass
+        has_price = '$' in text or 'price' in text
+        has_sale_terms = any(term in text for term in [
+            'shipped', 'obo', 'for sale', 'selling', 'paypal', 'venmo',
+            'pick up', 'available', 'firm', 'sealed', 'mint'
+        ])
+        
+        if has_price and has_sale_terms and len(text) > 30:
+            logger.info(f"FORCE VALIDATION: Sale post with price and sale terms")
+            return True
+        
+        return False
+
     async def scrape_with_thread_boundary_detection(self, num_posts=10):
-        """UPDATED: Main scraping with improved boundary detection"""
+        """ENHANCED: Main scraping with debug dumps for failed validations"""
         logger.info(f"Starting scraping of {num_posts} posts")
         
-        # Reset counter for new scraping session
         self.absolute_post_counter = 0
-        
         posts = []
         scroll_attempts = 0
-        max_scrolls = 20
+        max_scrolls = 15
         container_position = 0
         containers_checked = 0
+        failed_validations = 0
+        max_failed_validations = 8
         
         await self.close_any_modals()
         
-        while len(posts) < num_posts and scroll_attempts < max_scrolls:
+        while len(posts) < num_posts and scroll_attempts < max_scrolls and failed_validations < max_failed_validations:
             try:
                 all_containers = await self.page.locator('[role="article"]').all()
                 total_containers = len(all_containers)
                 
                 logger.debug(f"Total containers available: {total_containers}, starting from position {container_position}")
                 
-                # If we've checked all current containers, scroll for more
                 if container_position >= total_containers:
                     logger.info(f"Reached end of current containers ({total_containers}), scrolling for more...")
                     await self.page.keyboard.press('End')
@@ -425,59 +531,72 @@ class FacebookGroupScraper:
                     scroll_attempts += 1
                     continue
                 
-                # IMPROVED: Check containers in smaller batches to avoid missing posts
                 found_post = False
-                batch_size = 5  # Reduced from 20
+                batch_size = 5
                 
                 for i in range(container_position, min(container_position + batch_size, total_containers)):
                     containers_checked += 1
                     container = all_containers[i]
                     
                     try:
-                        # Reduced timeouts for faster processing
-                        html_content = await container.inner_html(timeout=1500)
-                        text_content = await container.text_content(timeout=1200) or ""
-                        html_size = len(html_content)
+                        content_data = await self.get_container_content_safely(container, "detection")
                         
-                        # Log what we're checking
-                        preview = ' '.join(text_content.split()[:8])[:40]
-                        logger.debug(f"Checking container {i+1}: {html_size} bytes, preview: {preview}...")
+                        if not content_data['text_content']:
+                            logger.debug(f"Container {i+1}: No content, skipping")
+                            continue
                         
-                        # Check if it's a loading placeholder
-                        if 'aria-label="Loading"' in html_content or 'role="status"' in html_content:
+                        preview = ' '.join(content_data['text_content'].split()[:8])[:40]
+                        logger.debug(f"Checking container {i+1}: {content_data['html_size']} bytes, preview: {preview}...")
+                        
+                        if ('aria-label="Loading"' in content_data['html_content'] or 
+                            'role="status"' in content_data['html_content']):
                             logger.debug(f"Container {i+1} is a loading placeholder, skipping")
                             continue
                         
-                        # IMPROVED: Use boundary detection logic for main post identification
-                        if self._is_likely_main_post_for_boundary(text_content, html_size):
+                        if self._is_likely_main_post_for_boundary(content_data['text_content'], content_data['html_size']):
                             logger.info(f"Found main post at container {i+1}")
                             
-                            # Process this post
-                            post_data, boundary_index = await self.process_post_with_complete_thread(
+                            container_data = {
+                                'container': container,
+                                'content': content_data,
+                                'index': i
+                            }
+                            
+                            target_post_number = len(posts) + 1
+                            
+                            post_data, boundary_index = await self.process_post_with_stored_content(
                                 all_containers, 
-                                i,
-                                len(posts) + 1
+                                container_data,
+                                target_post_number
                             )
                             
                             if post_data and self.validate_main_post_data(post_data):
                                 posts.append(post_data)
                                 logger.success(f"✅ Successfully scraped post #{self.absolute_post_counter} -> Saved as post {len(posts)}/{num_posts}")
                                 
-                                # Show key details
-                                self.print_enhanced_post_summary(post_data, self.absolute_post_counter)
+                                # OPTIONAL: Dump successful posts for comparison
+                                # await self.dump_successful_post_debug(container_data, post_data, i+1)
                                 
+                                self.print_enhanced_post_summary(post_data, self.absolute_post_counter)
                                 self.posts_data = posts.copy()
                                 
                                 if len(posts) % 3 == 0:
                                     logger.info(f"Auto-saving progress at {len(posts)} posts")
                                     await self.auto_save(posts)
+                                
+                                failed_validations = 0
                             else:
-                                logger.warning(f"❌ Post #{self.absolute_post_counter} failed validation")
+                                failed_validations += 1
+                                logger.warning(f"❌ Post #{self.absolute_post_counter} failed validation ({failed_validations}/{max_failed_validations})")
+                                
+                                # CRITICAL: Create debug dump for failed validation
+                                if post_data:
+                                    logger.info(f"Creating comprehensive debug dump for failed post...")
+                                    await self.dump_failed_post_debug(container_data, post_data, i+1)
                             
-                            # Move position to after this post's thread
                             container_position = boundary_index
                             found_post = True
-                            scroll_attempts = 0  # Reset scroll attempts on success
+                            scroll_attempts = 0
                             break
                         else:
                             logger.debug(f"Container {i+1} is not a main post")
@@ -486,13 +605,11 @@ class FacebookGroupScraper:
                         logger.debug(f"Error checking container {i+1}: {str(e)[:50]}")
                         continue
                 
-                # If we didn't find a post in this batch, move forward more conservatively
                 if not found_post:
                     container_position = min(container_position + batch_size, total_containers)
                     logger.debug(f"No posts found in batch, advancing to position {container_position}")
                     
-                    # If we're near the end, scroll for more
-                    if container_position >= total_containers - 10:  # Increased buffer
+                    if container_position >= total_containers - 10:
                         logger.info("Near end of containers, scrolling for more...")
                         await self.page.keyboard.press('End')
                         await asyncio.sleep(3)
@@ -501,14 +618,78 @@ class FacebookGroupScraper:
             except Exception as e:
                 logger.error(f"Error in scraping loop: {str(e)[:100]}")
                 scroll_attempts += 1
-                container_position += 2  # Smaller increment on error
+                container_position += 2
                 continue
+        
+        if failed_validations >= max_failed_validations:
+            logger.warning(f"Stopping due to too many validation failures ({failed_validations})")
+            logger.info("Check the debug dump files in your output directory for analysis")
         
         self.posts_data = posts
         logger.info(f"Completed scraping: {len(posts)} valid posts from {self.absolute_post_counter} total processed")
         logger.info(f"Checked {containers_checked} containers total")
         return posts
 
+    async def process_post_with_stored_content(self, containers, container_data, post_num):
+        """FIXED: Process post using pre-extracted content with proper numbering"""
+        
+        self.absolute_post_counter += 1
+        absolute_num = self.absolute_post_counter
+        
+        main_container = container_data['container']
+        stored_content = container_data['content']
+        main_post_index = container_data['index']
+        
+        # Use stored content for preview to ensure it matches what we detected
+        preview_text = ' '.join(stored_content['text_content'].split()[:20])[:100]
+        if len(preview_text) > 100:
+            preview_text = preview_text[:100] + "..."
+        
+        logger.info(f"")
+        logger.info(f"{'='*60}")
+        logger.info(f"📍 POST #{absolute_num} (container {main_post_index + 1})")
+        logger.info(f"📝 Preview: {preview_text}")
+        logger.info(f"{'='*60}")
+        
+        if self.visual_highlight:
+            await self.highlight_element(main_container)
+        
+        try:
+            # Find boundary using same consistent method
+            boundary_index = await self.find_post_boundary_consistent(containers, main_post_index)
+            thread_containers = containers[main_post_index:boundary_index]
+            comment_containers = thread_containers[1:]
+            
+            # CRITICAL FIX: Pass the correct post_num, not hardcoded 1
+            post_data = await self.extract_post_data_with_stored_content(
+                main_container, 
+                stored_content, 
+                post_num  # Use the actual post number being processed
+            )
+            
+            logger.success(f"Extracted main post data for post {post_num}")
+            
+            # Process comments if present
+            if comment_containers:
+                logger.debug(f"Processing {len(comment_containers)} comment containers")
+                comment_container_info_list = []
+                for container in comment_containers:
+                    comment_container_info_list.append({'container': container})
+                
+                max_comments = min(100, len(thread_containers) * 2)
+                
+                await self.process_complete_comment_thread(
+                    post_data, 
+                    comment_container_info_list,
+                    max_comments=max_comments
+                )
+            
+            return post_data, boundary_index
+            
+        except Exception as e:
+            logger.error(f"Error processing thread: {str(e)[:100]}")
+            return None, main_post_index + 1
+    
     async def scrape_with_sold_detection(self, num_posts=10):
         """Simplified sequential processing - just go through posts 1, 2, 3, 4..."""
         logger.info(f"Starting sequential sold items detection for {num_posts} posts")
@@ -1302,7 +1483,6 @@ class FacebookGroupScraper:
         
         return final_classification['type'] == 'main_post'
     
-
     async def find_post_boundary(self, containers, start_index):
         """FIXED: More aggressive boundary detection to catch all main posts"""
         
@@ -1346,8 +1526,201 @@ class FacebookGroupScraper:
         logger.debug(f"No boundary found in range, using limit: {look_ahead_limit}")
         return look_ahead_limit
 
+    async def find_post_boundary_consistent(self, containers, start_index):
+        """Boundary detection using consistent extraction method"""
+        
+        look_ahead_limit = min(len(containers), start_index + 20)
+        logger.debug(f"Looking for boundary starting from container {start_index + 1}")
+        
+        for i in range(start_index + 1, look_ahead_limit):
+            try:
+                container = containers[i]
+                
+                # Use consistent extraction method
+                content_data = await self.get_container_content_safely(container, "boundary")
+                
+                if content_data['html_size'] < 200:
+                    continue
+                
+                preview = ' '.join(content_data['text_content'].split()[:8])[:40]
+                
+                # Use same boundary detection logic with consistent content
+                if self._is_likely_main_post_for_boundary(content_data['text_content'], content_data['html_size']):
+                    logger.debug(f"Boundary found at container {i+1} (preview: {preview}...)")
+                    return i
+                else:
+                    logger.debug(f"Container {i+1}: Not boundary ({content_data['html_size']} bytes, preview: {preview}...)")
+                            
+            except Exception as e:
+                logger.debug(f"Container {i+1}: Error checking ({str(e)[:30]})")
+                continue
+        
+        logger.debug(f"No boundary found in range, using limit: {look_ahead_limit}")
+        return look_ahead_limit
+
+    async def extract_post_data_with_stored_content(self, post_element, stored_content, post_num):
+        """FIXED: Extract post data using stored content to ensure consistency"""
+        
+        post_data = {
+            'post_number': post_num,
+            'text': '',
+            'author': '',
+            'time': '',
+            'post_id': f"post_{post_num}_{self.session_id}",
+            'scraped_at': datetime.now().isoformat(),
+            'images': [],
+            'comments': [],
+            'image_count': 0,
+            'comment_count': 0
+        }
+        
+        try:
+            # CRITICAL FIX: Remove 'await' - this is not an async function
+            post_data['text'] = self.extract_text_from_stored_content(stored_content['text_content'])
+            
+            # Extract other data normally with proper error handling
+            try:
+                author = await asyncio.wait_for(
+                    self.extract_author_improved_fixed(post_element),
+                    timeout=3.0
+                )
+                post_data['author'] = author
+            except Exception as e:
+                logger.debug(f"Author extraction error: {str(e)[:50]}")
+                post_data['author'] = ""  # Provide fallback
+            
+            try:
+                time_str = await asyncio.wait_for(
+                    self.extract_time_improved(post_element),
+                    timeout=2.0
+                )
+                post_data['time'] = time_str
+            except Exception as e:
+                logger.debug(f"Time extraction error: {str(e)[:50]}")
+                post_data['time'] = ""  # Provide fallback
+            
+            try:
+                images = await asyncio.wait_for(
+                    self.extract_images_safe(post_element, f"post_{post_num}"),
+                    timeout=3.0
+                )
+                post_data['images'] = images
+                post_data['image_count'] = len(images)
+                
+                if self.download_images and images:
+                    await self.download_images_for_post(images, f"post_{post_num}")
+            except Exception as e:
+                logger.debug(f"Image extraction error: {str(e)[:50]}")
+                post_data['images'] = []
+                post_data['image_count'] = 0
+            
+            # Extract sale info if we have text
+            if post_data['text']:
+                post_data['sale_info'] = self.extract_collectible_info(post_data)
+            else:
+                post_data['sale_info'] = None
+                    
+        except Exception as e:
+            logger.error(f"Major error in data extraction: {str(e)[:100]}")
+        
+        return post_data
+
+    def extract_text_from_stored_content(self, stored_text):
+        """FIXED: Better separation of main post content from comments"""
+        if not stored_text:
+            return ""
+        
+        text = stored_text.strip()
+        
+        # CRITICAL FIX: Remove comment sections that get concatenated
+        # Look for the pattern where comments start
+        comment_markers = [
+            'LikeCommentDanielle',  # Start of comment section
+            'LikeComment',          # Generic comment start
+            'All reactions:',       # Facebook reactions section
+            'MessageAll reactions', # Another variant
+            'CommentDanielle',      # Direct comment start
+        ]
+        
+        # Find where comments begin and truncate there
+        for marker in comment_markers:
+            if marker in text:
+                comment_start = text.find(marker)
+                if comment_start > 50:  # Only truncate if we have substantial content before
+                    text = text[:comment_start].strip()
+                    logger.debug(f"Truncated text at comment marker: {marker}")
+                    break
+        
+        # Additional cleanup for comment patterns at the end
+        # Remove trailing UI elements that got concatenated
+        trailing_patterns = [
+            r'AuthorStill available\d+[dwmyh].*$',
+            r'Author.*\d+[dwmyh].*LikeReply.*$',
+            r'Comment as .*$',
+            r'LikeReply.*$',
+            r'All reactions.*$'
+        ]
+        
+        for pattern in trailing_patterns:
+            text = re.sub(pattern, '', text).strip()
+        
+        # Clean up excessive whitespace
+        text = re.sub(r'\s+', ' ', text)
+        
+        # Basic filtering of remaining UI elements
+        lines = text.split('\n')
+        filtered_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if len(line) > 10:
+                # Filter out obvious UI elements
+                if not any(skip in line.lower() for skip in [
+                    'write a comment', 'comment as', 'click to expand'
+                ]):
+                    filtered_lines.append(line)
+        
+        # Use filtered lines if we have them, otherwise use cleaned text
+        if filtered_lines:
+            result = ' '.join(filtered_lines)
+        else:
+            result = text
+        
+        # Final cleanup and length limit
+        result = result.strip()
+        if len(result) > 2000:
+            result = result[:2000]
+        
+        logger.debug(f"Text extraction result: {len(result)} chars")
+        return result
+
+    async def get_container_content_safely(self, container, purpose="detection"):
+        """Single method to consistently extract content from containers"""
+        try:
+            # Use same extraction method for both detection and final processing
+            # with longer timeout for final processing
+            timeout = 2000 if purpose == "detection" else 5000
+            
+            html_content = await container.inner_html(timeout=timeout)
+            text_content = await container.text_content(timeout=timeout) or ""
+            
+            return {
+                'html_content': html_content,
+                'text_content': text_content,
+                'html_size': len(html_content),
+                'text_length': len(text_content)
+            }
+        except Exception as e:
+            logger.debug(f"Content extraction failed ({purpose}): {str(e)[:50]}")
+            return {
+                'html_content': '',
+                'text_content': '',
+                'html_size': 0,
+                'text_length': 0
+            }
+
     def _is_likely_main_post_for_boundary(self, text_content, html_size):
-        """IMPROVED: More comprehensive detection to catch missed posts"""
+        """SAME AS BEFORE - keeping the improved version"""
         
         if not text_content or len(text_content.strip()) < 10:
             return False
@@ -1358,44 +1731,33 @@ class FacebookGroupScraper:
             text_content.endswith('Reply') and len(text_content) < 80,
             text_content.endswith('Like') and len(text_content) < 50,
             ('Author' in text_content and len(text_content) < 100 and 
-            text_content.count('Â·') < 2),  # Comment pattern but not post pattern
-            len(text_content.strip()) < 25,  # Very short content
+            text_content.count('·') < 2),
+            len(text_content.strip()) < 25,
         ]
         
         if any(comment_rejections):
             return False
         
-        # STRONG POSITIVE SIGNALS - any of these should create boundary
+        # STRONG POSITIVE SIGNALS
         strong_signals = [
-            # Facebook post structure
             'Shared with Private group' in text_content,
             'Shared with Public' in text_content,
-            
-            # Content expansion
             'See more' in text_content,
-            
-            # Sale post indicators for toy collecting
             '$' in text_content and len(text_content) > 50,
             any(word in text_content.lower() for word in [
                 'for sale', 'selling', 'shipped', 'obo', 'paypal', 'venmo'
             ]),
-            
-            # GI Joe / toy specific terms
             any(term in text_content.lower() for term in [
                 'gi joe', 'cobra', 'terrordome', 'flagg', 'kre-o', 'hasbro',
                 'complete', 'sealed', 'moc', 'mip', 'loose', 'mint'
             ]),
-            
-            # Structural content indicators
-            text_content.count('.') >= 3,  # Multiple sentences
-            len(text_content.split('\n')) > 3,  # Multiple paragraphs
-            len(text_content) > 250,  # Substantial content
-            
-            # Author/time structure (main posts, not comments)
-            (text_content.count('Â·') >= 2 and 'Author' not in text_content),
+            text_content.count('.') >= 3,
+            len(text_content.split('\n')) > 3,
+            len(text_content) > 250,
+            (text_content.count('·') >= 2 and 'Author' not in text_content),
         ]
         
-        # MEDIUM POSITIVE SIGNALS - need multiple for boundary
+        # MEDIUM SIGNALS
         medium_signals = [
             len(text_content) > 150,
             text_content.count('.') >= 2,
@@ -1406,17 +1768,15 @@ class FacebookGroupScraper:
             ]),
         ]
         
-        # Count signals
         strong_count = sum(1 for signal in strong_signals if signal)
         medium_count = sum(1 for signal in medium_signals if signal)
         
-        # DECISION LOGIC - be more inclusive to catch missed posts
         if strong_count >= 1:
-            return True  # Any strong signal = boundary
+            return True
         elif medium_count >= 3:
-            return True  # Multiple medium signals = boundary
+            return True
         elif medium_count >= 2 and html_size > 30000:
-            return True  # Some medium signals + size = boundary
+            return True
         else:
             return False
     
@@ -1970,37 +2330,6 @@ class FacebookGroupScraper:
         
         return most_recent_post_idx
 
-    def validate_main_post_data(self, post_data):
-        """UPDATED: Validation using structural analysis instead of size"""
-        if not post_data:
-            return False
-        
-        text = post_data.get('text', '')
-        
-        # Reject obvious comment patterns that slipped through
-        if text:
-            classification = self._classify_by_structural_patterns(text)
-            if classification['type'] == 'comment' and classification['confidence'] >= 80:
-                logger.debug(f"Post validation failed: Detected as comment ({classification['confidence']}%)")
-                return False
-        
-        # Content quality validation
-        has_text = bool(text.strip())
-        has_author = bool(post_data.get('author', '').strip())
-        has_images = post_data.get('image_count', 0) > 0
-        has_substantial_content = len(text) > 80  # Increased threshold
-        has_structure = text.count('.') > 1 or text.count('\n') > 1
-        
-        # Require multiple quality indicators
-        quality_indicators = [has_text, has_author, has_images, has_substantial_content, has_structure]
-        quality_score = sum(quality_indicators)
-        
-        is_valid = quality_score >= 2  # Need at least 2 quality indicators
-        
-        logger.debug(f"Validation: text={has_text}, author={has_author}, images={has_images}, "
-                    f"substantial={has_substantial_content}, structure={has_structure} => Valid={is_valid}")
-        
-        return is_valid
 
     async def wait_for_post_content(self, post_element, max_wait=10):
         """Wait for a post element to load real content"""
@@ -3542,6 +3871,240 @@ class FacebookGroupScraper:
         
         logger.info("=" * 60)
 
+    async def debug_extraction_consistency(self, container_index):
+        """Debug method to check extraction consistency for a specific container"""
+        logger.info("=" * 60)
+        logger.info(f"EXTRACTION CONSISTENCY DEBUG - Container {container_index}")
+        logger.info("=" * 60)
+        
+        try:
+            all_containers = await self.page.locator('[role="article"]').all()
+            
+            if container_index >= len(all_containers):
+                logger.info(f"Container {container_index} does not exist")
+                return
+            
+            container = all_containers[container_index - 1]  # Convert to 0-based
+            
+            # Extract content multiple times to check consistency
+            logger.info("Testing extraction consistency...")
+            
+            extractions = []
+            for i in range(3):
+                content_data = await self.get_container_content_safely(container, f"test_{i+1}")
+                extractions.append(content_data)
+                
+                preview = ' '.join(content_data['text_content'].split()[:15])[:80]
+                logger.info(f"Extraction {i+1}: {preview}...")
+                logger.info(f"  Length: {content_data['text_length']} chars, HTML: {content_data['html_size']} bytes")
+                
+                await asyncio.sleep(0.5)  # Small delay between extractions
+            
+            # Check for consistency
+            all_same = all(
+                ext['text_content'] == extractions[0]['text_content'] 
+                for ext in extractions
+            )
+            
+            if all_same:
+                logger.success("✅ EXTRACTION CONSISTENT: All 3 extractions returned identical content")
+            else:
+                logger.warning("⚠️ EXTRACTION INCONSISTENT: Content varied between extractions")
+                logger.info("This suggests Facebook is dynamically updating container content")
+            
+            logger.info("=" * 60)
+            
+        except Exception as e:
+            logger.error(f"Debug extraction failed: {str(e)[:50]}")
+            logger.info("=" * 60)
+
+    async def dump_failed_post_debug(self, container_data, post_data, container_index):
+        """Comprehensive debug dump for failed validation posts"""
+        
+        debug_file = self.output_dir / f"failed_post_debug_container_{container_index}.html"
+        
+        try:
+            stored_content = container_data['content']
+            
+            debug_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Failed Post Debug - Container {container_index}</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            .section {{ border: 1px solid #ccc; margin: 10px 0; padding: 10px; }}
+            .header {{ background: #f0f0f0; font-weight: bold; }}
+            .content {{ white-space: pre-wrap; }}
+            .pass {{ color: green; }}
+            .fail {{ color: red; }}
+            .warning {{ color: orange; }}
+        </style>
+    </head>
+    <body>
+        <h1>Failed Post Debug - Container {container_index}</h1>
+        <p>Generated: {datetime.now().isoformat()}</p>
+        
+        <div class="section">
+            <div class="header">1. RAW HTML CONTENT ({len(stored_content['html_content'])} bytes)</div>
+            <div class="content">{stored_content['html_content'][:5000]}{'...[TRUNCATED]' if len(stored_content['html_content']) > 5000 else ''}</div>
+        </div>
+        
+        <div class="section">
+            <div class="header">2. RAW TEXT CONTENT ({len(stored_content['text_content'])} chars)</div>
+            <div class="content">{stored_content['text_content']}</div>
+        </div>
+        
+        <div class="section">
+            <div class="header">3. PROCESSED TEXT CONTENT</div>
+            <div class="content">{post_data.get('text', '[NO TEXT EXTRACTED]')}</div>
+        </div>
+        
+        <div class="section">
+            <div class="header">4. EXTRACTED POST DATA</div>
+            <div class="content">
+    Author: "{post_data.get('author', '[NO AUTHOR]')}"
+    Time: "{post_data.get('time', '[NO TIME]')}"
+    Images: {post_data.get('image_count', 0)}
+    Comments: {post_data.get('comment_count', 0)}
+    Sale Info: {post_data.get('sale_info', 'None')}
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="header">5. STRUCTURAL CLASSIFICATION</div>
+    """
+            
+            # Add classification analysis
+            classification = self._classify_by_structural_patterns(stored_content['text_content'])
+            debug_html += f"""
+            <div class="content">
+    Type: {classification['type']}
+    Confidence: {classification['confidence']}%
+    Reason: {classification['reason']}
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="header">6. VALIDATION ANALYSIS</div>
+            <div class="content">
+    """
+            
+            # Detailed validation breakdown
+            text = post_data.get('text', '')
+            author = post_data.get('author', '')
+            
+            has_text = bool(text.strip()) and len(text.strip()) > 15
+            has_author = bool(author.strip())
+            has_images = post_data.get('image_count', 0) > 0
+            has_comments = post_data.get('comment_count', 0) > 0
+            
+            # Sale post detection
+            is_sale_post = False
+            if text:
+                sale_indicators = ['$', 'price', 'obo', 'shipped', 'paypal', 'venmo', 'for sale', 'selling']
+                found_indicators = [ind for ind in sale_indicators if ind in text.lower()]
+                is_sale_post = len(found_indicators) > 0
+            
+            debug_html += f"""
+    Text Check: <span class="{'pass' if has_text else 'fail'}">{'PASS' if has_text else 'FAIL'}</span> (Length: {len(text)} chars, stripped: {len(text.strip())})
+    Author Check: <span class="{'pass' if has_author else 'fail'}">{'PASS' if has_author else 'FAIL'}</span> (Value: "{author}")
+    Images Check: <span class="{'pass' if has_images else 'fail'}">{'PASS' if has_images else 'FAIL'}</span> (Count: {post_data.get('image_count', 0)})
+    Comments Check: <span class="{'pass' if has_comments else 'fail'}">{'PASS' if has_comments else 'FAIL'}</span> (Count: {post_data.get('comment_count', 0)})
+    Sale Post Check: <span class="{'pass' if is_sale_post else 'fail'}">{'PASS' if is_sale_post else 'FAIL'}</span> (Indicators: {found_indicators if 'found_indicators' in locals() else 'None'})
+
+    Quality Score: {sum([has_text, has_author, has_images, has_comments])}/4
+    Classification Override: {'YES' if classification['type'] == 'comment' and classification['confidence'] >= 85 else 'NO'}
+
+    FINAL RESULT: <span class="{'fail'}">VALIDATION FAILED</span>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="header">7. TEXT COMPARISON</div>
+            <div class="content">
+    Raw text first 200 chars: {stored_content['text_content'][:200]}...
+
+    Processed text first 200 chars: {text[:200]}...
+
+    Are they the same? {'YES' if stored_content['text_content'][:200] == text[:200] else 'NO'}
+            </div>
+        </div>
+        
+    </body>
+    </html>
+    """
+            
+            # Write debug file
+            with open(debug_file, 'w', encoding='utf-8') as f:
+                f.write(debug_html)
+            
+            logger.info(f"DEBUG DUMP created: {debug_file}")
+            logger.info(f"Open this file in your browser to see detailed analysis")
+            
+        except Exception as e:
+            logger.error(f"Failed to create debug dump: {str(e)}")
+
+    async def dump_successful_post_debug(self, container_data, post_data, container_index):
+        """Also dump successful posts for comparison"""
+        
+        debug_file = self.output_dir / f"successful_post_debug_container_{container_index}.html"
+        
+        try:
+            stored_content = container_data['content']
+            
+            debug_html = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Successful Post Debug - Container {container_index}</title>
+                    <style>
+                        body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                        .section {{ border: 1px solid #ccc; margin: 10px 0; padding: 10px; }}
+                        .header {{ background: #e8f5e8; font-weight: bold; }}
+                        .content {{ white-space: pre-wrap; }}
+                        .pass {{ color: green; }}
+                    </style>
+                </head>
+                <body>
+                    <h1>Successful Post Debug - Container {container_index}</h1>
+                    <p>Generated: {datetime.now().isoformat()}</p>
+                    
+                    <div class="section">
+                        <div class="header">PROCESSED TEXT CONTENT</div>
+                        <div class="content">{post_data.get('text', '[NO TEXT EXTRACTED]')}</div>
+                    </div>
+                    
+                    <div class="section">
+                        <div class="header">EXTRACTED POST DATA</div>
+                        <div class="content">
+                Author: "{post_data.get('author', '[NO AUTHOR]')}"
+                Time: "{post_data.get('time', '[NO TIME]')}"
+                Images: {post_data.get('image_count', 0)}
+                Comments: {post_data.get('comment_count', 0)}
+                Sale Info: {post_data.get('sale_info', 'None')}
+                        </div>
+                    </div>
+                    
+                    <div class="section">
+                        <div class="header">VALIDATION RESULT</div>
+                        <div class="content">
+                <span class="pass">VALIDATION PASSED</span>
+                        </div>
+                    </div>
+                    
+                </body>
+                </html>
+                """
+                
+            with open(debug_file, 'w', encoding='utf-8') as f:
+                f.write(debug_html)
+            
+            logger.info(f"SUCCESS DUMP created: {debug_file}")
+            
+        except Exception as e:
+            logger.error(f"Failed to create success dump: {str(e)}")
+
     ###^ 5- CLEANUP AND SAVE FUNCTIONS
     
     async def auto_save(self, posts_data=None):
@@ -3941,38 +4504,11 @@ async def main():
                 await scraper.navigate_to_group(group_id)
             
             
-            #! DEBUGGING
-            # Skip diagnosis for filtering modes to save time
-            if filter_choice == '1':  # Only for "all posts" mode
-                print("\n🔍 Running structural pattern debug analysis...")
-                await scraper.comprehensive_structural_debug()
-                
-                # Ask if they want to continue after seeing debug
-                continue_after_debug = input("\nContinue with scraping? (y/n, default=y): ").strip().lower()
-                if continue_after_debug == 'n':
-                    print("Exiting after debug analysis.")
-                    return
-            
-            print("\n🔍 Running boundary detection debug...")
-            await scraper.debug_boundary_detection(start_container=0, num_containers=40)
 
-            continue_after_debug = input("\nContinue with scraping? (y/n, default=y): ").strip().lower()
-            if continue_after_debug == 'n':
-                print("Exiting after debug analysis.")
-                return
-            
-            print("\n🔍 Debugging specific containers...")
-            await scraper.debug_specific_containers([3, 4, 5, 6])  # Check containers around the skip
-
-            continue_after_debug = input("\nContinue with scraping? (y/n, default=y): ").strip().lower()
-            if continue_after_debug == 'n':
-                print("Exiting after debug analysis.")
-                return
-            
             
             
             # How many posts?
-            num = input("\nNumber of posts to scrape (default 10): ").strip()
+            num = input("\nNumber of posts to scrape (default 5): ").strip()
             num_posts = int(num) if num else 10
             
             # Adjust expectations based on filtering mode
