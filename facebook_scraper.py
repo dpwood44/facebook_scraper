@@ -448,6 +448,11 @@ class FacebookGroupScraper:
                         
                         # Check if this is a main post
                         if self.is_main_post_container(text_content, html_size):
+                            
+                            if self._is_clearly_a_comment(text_content):
+                                logger.debug(f"Container {i+1} rejected: Comment pattern detected despite initial classification")
+                                continue
+                            
                             logger.info(f"Found main post at container {i+1}")
                             
                             # Process this post
@@ -1069,7 +1074,7 @@ class FacebookGroupScraper:
         return is_main_post
 
     def _is_main_post_original_logic(self, text_content, html_size):
-        """More lenient main post detection"""
+        """Improved main post detection with stricter comment filtering"""
         
         # Filter out obvious non-posts
         non_post_indicators = [
@@ -1091,58 +1096,84 @@ class FacebookGroupScraper:
         if html_size < 3000 and len(text_content) == 0:
             return False  # Likely a loading placeholder
         
-        # POSITIVE INDICATORS - any of these means it's likely a main post
+        # STRICT COMMENT REJECTION - These patterns should NEVER be main posts
+        strict_comment_patterns = [
+            # Comment endings - these are definitive comment indicators
+            text_content.endswith('LikeReply'),
+            text_content.endswith('Reply') and len(text_content) < 100,
+            text_content.endswith('Like') and len(text_content) < 100,
+            
+            # Comment author patterns
+            'Author' in text_content and len(text_content) < 150,  # "AuthorStill available2dLikeReply"
+            
+            # Short interactions that are clearly comments
+            len(text_content) < 30 and any(word in text_content.lower() for word in ['like', 'reply', 'comment']),
+            
+            # Typical comment structure patterns
+            text_content.count('Like') >= 2 and text_content.count('Reply') >= 1,
+            
+            # Very short content with time indicators (usually comments)
+            len(text_content) < 80 and any(time_word in text_content for time_word in ['2d', '1d', '3d', '1h', '2h']),
+            
+            # Single word or very short responses
+            len(text_content.split()) <= 5 and not '$' in text_content,
+        ]
+        
+        # If ANY strict comment pattern matches, reject immediately
+        if any(strict_comment_patterns):
+            return False
+        
+        # POSITIVE INDICATORS - these suggest it's a main post
         positive_indicators = [
-            # Price/sale indicators
-            '$' in text_content,
+            # Price/sale indicators (strong signals)
+            '$' in text_content and len(text_content) > 50,  # Must have substantial content too
             any(phrase in text_content.lower() for phrase in ['for sale', 'fs:', 'wts:', 'selling']),
             
             # Facebook post structure
             'Shared with Private group' in text_content,
-            '·' in text_content and any(time in text_content for time in ['ago', 'at', 'AM', 'PM']),
+            'Â·' in text_content and any(time in text_content for time in ['ago', 'at', 'AM', 'PM']),
             
-            # Author patterns
-            any(word in text_content for word in ['Follow', 'Admin', 'Moderator']),
+            # Substantial content indicators
+            html_size > 50000,  # Increased threshold for high confidence
+            len(text_content) > 200,  # Substantial text content
             
-            # Size indicators
-            html_size > 30000,
-            len(text_content) > 100,
+            # Post-specific patterns
+            'See more' in text_content or 'â€¦ See more' in text_content,
             
-            # Has images or links (based on text patterns)
-            'See more' in text_content,
-            '… See more' in text_content,
+            # Multiple lines of content (comments are usually shorter)
+            len(text_content.split('\n')) > 3,
+            
+            # Author context with substantial content
+            any(word in text_content for word in ['Follow', 'Admin', 'Moderator']) and len(text_content) > 100,
         ]
         
-        # NEGATIVE INDICATORS - strong signals it's NOT a main post
-        negative_indicators = [
-            # Comment endings
-            text_content.endswith('LikeReply'),
-            text_content.endswith('Reply') and len(text_content) < 50,
-            text_content.endswith('Like') and len(text_content) < 30,
-            
-            # Too short
-            len(text_content) < 20 and '$' not in text_content,
+        # WEAK POSITIVE INDICATORS - need multiple to confirm
+        weak_positive_indicators = [
+            html_size > 20000,
+            len(text_content) > 100,
+            'Â·' in text_content,  # Could be author separator
+            any(social_word in text_content for social_word in ['Follow', 'Share', 'Comment']),
         ]
         
         # Count positive indicators
-        positive_count = sum(1 for indicator in positive_indicators if indicator)
-        negative_count = sum(1 for indicator in negative_indicators if indicator)
+        strong_positive_count = sum(1 for indicator in positive_indicators if indicator)
+        weak_positive_count = sum(1 for indicator in weak_positive_indicators if indicator)
         
-        # Decision logic - be more lenient
-        if positive_count >= 2:
-            return True
-        elif negative_count >= 2:
-            return False
-        elif positive_count >= 1 and negative_count == 0:
-            return True
-        elif html_size > 20000:  # Large enough to likely be a post
-            return True
+        # DECISION LOGIC - Much more conservative
+        if strong_positive_count >= 2:
+            return True  # Multiple strong indicators
+        elif strong_positive_count >= 1 and weak_positive_count >= 2:
+            return True  # One strong + multiple weak
+        elif strong_positive_count >= 1 and html_size > 30000:
+            return True  # One strong indicator + large size
+        elif weak_positive_count >= 4 and html_size > 40000:
+            return True  # Many weak indicators + very large size
         else:
-            # Default to false only for very small content
-            return html_size > 5000 or len(text_content) > 50
+            return False  # Default to rejecting if not clearly a main post
+    
 
     async def find_post_boundary(self, containers, start_index):
-        """Enhanced boundary detection with better validation"""
+        """Enhanced boundary detection with stricter main post validation"""
         
         # Look ahead further for posts that might have long comment threads
         look_ahead_limit = min(len(containers), start_index + 35)
@@ -1160,20 +1191,25 @@ class FacebookGroupScraper:
                     html_size = len(html_content)
                     
                     # Skip tiny placeholders
-                    if html_size < 300:
+                    if html_size < 500:  # Increased from 300
                         logger.debug(f"Container {i+1}: Too small ({html_size} bytes), skipping")
                         continue
                     
                     # Get a preview of this container for debugging
                     preview = ' '.join(text_content.split()[:10])[:50]
                     
-                    # If this looks like a main post, we found our boundary
+                    # STRICT COMMENT CHECK FIRST - if it's clearly a comment, skip it
+                    if self._is_clearly_a_comment(text_content):
+                        logger.debug(f"Container {i+1}: Clearly a comment ({preview}...)")
+                        continue
+                    
+                    # Now check if this looks like a main post
                     if self.is_main_post_container(text_content, html_size):
                         logger.debug(f"Boundary found at container {i+1} (next main post: {preview}...)")
                         return i
                     else:
                         logger.debug(f"Container {i+1}: Not a main post ({html_size} bytes, preview: {preview}...)")
-                        
+                            
                 except Exception as e:
                     logger.debug(f"Container {i+1}: Error checking ({str(e)[:30]})")
                     continue
@@ -1184,6 +1220,34 @@ class FacebookGroupScraper:
         # If we didn't find a boundary within our look-ahead limit
         logger.debug(f"No boundary found in look-ahead range (checked {look_ahead_limit - start_index - 1} containers)")
         return look_ahead_limit
+
+    def _is_clearly_a_comment(self, text_content):
+        """Quick check if content is definitely a comment"""
+        if not text_content:
+            return False
+            
+        # Definitive comment patterns
+        comment_patterns = [
+            # Ends with comment UI elements
+            text_content.endswith('LikeReply'),
+            text_content.endswith('Reply') and len(text_content) < 100,
+            text_content.endswith('Like') and len(text_content) < 50,
+            
+            # Comment author patterns
+            'Author' in text_content and len(text_content) < 100,
+            
+            # Very short responses
+            len(text_content.strip()) < 20 and not '$' in text_content,
+            
+            # Common comment phrases
+            text_content.strip().lower() in ['yes', 'no', 'thanks', 'pm sent', 'interested', 'still available?'],
+            
+            # Single emoji or very short reactions
+            len(text_content.strip()) < 10 and any(char in text_content for char in ['👍', '❤️', '😊', '🔥']),
+        ]
+        
+        return any(comment_patterns)
+
 
     ###^ 2.3 - SALE POST DETECTION
 
@@ -1317,6 +1381,7 @@ class FacebookGroupScraper:
         
 
     ###^ 3 - COMMENT SCRAPING
+    # region
 
     async def process_complete_comment_thread(self, post_data, comment_containers, max_comments=50):
         """Process complete comment threads with robust error handling for large threads"""
@@ -1565,7 +1630,7 @@ class FacebookGroupScraper:
         except Exception as e:
             print(f"          ⚠️ Failed to download comment image: {str(e)[:50]}")
 
-
+    # endregion
 
     ###^ 4 - PROCESSING & VALIDATION
 
@@ -1707,21 +1772,30 @@ class FacebookGroupScraper:
         
         return most_recent_post_idx
 
-
     def validate_main_post_data(self, post_data):
-        """Validation specifically for main posts (not comments)"""
+        """Enhanced validation for main posts"""
         if not post_data:
             return False
         
-        # Main posts should have substantial content
-        has_text = bool(post_data.get('text', '').strip())
+        text = post_data.get('text', '')
+        
+        # Reject obvious comment patterns even if they passed earlier detection
+        if (text.endswith('LikeReply') or 
+            ('Author' in text and len(text) < 100) or
+            len(text.strip()) < 30):
+            logger.debug(f"Post validation failed: Comment pattern detected")
+            return False
+        
+        # Original validation logic
+        has_text = bool(text.strip())
         has_author = bool(post_data.get('author', '').strip())
         has_images = post_data.get('image_count', 0) > 0
-        has_substantial_content = len(post_data.get('text', '')) > 50
+        has_substantial_content = len(text) > 50
         
         is_valid = (has_text and has_author) or has_images or has_substantial_content
         
-        print(f"   Validation: text={has_text}, author={has_author}, images={has_images}, substantial={has_substantial_content} => Valid={is_valid}")
+        if not is_valid:
+            logger.debug(f"Post validation failed: Insufficient content")
         
         return is_valid
 
@@ -2777,62 +2851,82 @@ class FacebookGroupScraper:
         
         print("")  # Blank line for readability
 
-    async def debug_all_containers(self):
-        """Debug method to inspect all containers and show why they're filtered"""
+    async def debug_container_classification(self, container, index):
+        """Detailed debug information for a single container"""
+        try:
+            html_content = await container.inner_html(timeout=2000)
+            text_content = await container.text_content(timeout=1500) or ""
+            html_size = len(html_content)
+            
+            # Get preview
+            preview = ' '.join(text_content.split()[:15])[:80]
+            
+            # Run detection
+            is_main = self.is_main_post_container(text_content, html_size)
+            
+            # Analyze specific patterns
+            analysis = {
+                'ends_with_likereply': text_content.endswith('LikeReply'),
+                'has_author_word': 'Author' in text_content,
+                'text_length': len(text_content),
+                'has_price': '$' in text_content,
+                'has_group_marker': 'Shared with Private group' in text_content,
+                'has_separator': 'Â·' in text_content,
+                'html_size': html_size,
+                'has_see_more': 'See more' in text_content,
+            }
+            
+            logger.info(f"Container {index + 1} DETAILED ANALYSIS:")
+            logger.info(f"  Preview: {preview}")
+            logger.info(f"  Classification: {'MAIN POST' if is_main else 'NOT MAIN POST'}")
+            logger.info(f"  Text length: {len(text_content)} chars")
+            logger.info(f"  HTML size: {html_size} bytes")
+            
+            # Show specific pattern matches
+            patterns_found = []
+            if analysis['ends_with_likereply']:
+                patterns_found.append("❌ ENDS WITH 'LikeReply' (COMMENT PATTERN)")
+            if analysis['has_author_word'] and len(text_content) < 150:
+                patterns_found.append("❌ Short text with 'Author' (COMMENT PATTERN)")
+            if analysis['has_price']:
+                patterns_found.append("✅ Has price ($)")
+            if analysis['has_group_marker']:
+                patterns_found.append("✅ Has group marker")
+            if analysis['has_separator']:
+                patterns_found.append("✅ Has separator (Â·)")
+            if analysis['html_size'] > 50000:
+                patterns_found.append("✅ Large HTML (>50k)")
+            if analysis['has_see_more']:
+                patterns_found.append("✅ Has 'See more'")
+                
+            for pattern in patterns_found:
+                logger.info(f"  {pattern}")
+                
+            return is_main, analysis
+            
+        except Exception as e:
+            logger.error(f"Debug analysis failed for container {index + 1}: {str(e)[:50]}")
+            return False, {}
+
+    async def debug_all_containers_enhanced(self):
+        """Enhanced debug with detailed classification reasoning"""
         logger.info("=" * 60)
-        logger.info("DEBUG: Inspecting all containers")
+        logger.info("ENHANCED DEBUG: Container Classification Analysis")
         logger.info("=" * 60)
         
         all_containers = await self.page.locator('[role="article"]').all()
+        main_post_count = 0
         
-        for i, container in enumerate(all_containers[:20]):  # Check first 20
-            try:
-                html_content = await container.inner_html(timeout=2000)
-                text_content = await container.text_content(timeout=1500) or ""
-                html_size = len(html_content)
-                
-                # Get preview
-                preview = ' '.join(text_content.split()[:15])[:100]
-                
-                # Check if it's a main post
-                is_main = self.is_main_post_container(text_content, html_size)
-                
-                # Analyze why or why not
-                reasons = []
-                
-                # Check positive indicators
-                if '$' in text_content:
-                    reasons.append("✓ Has price")
-                if 'Shared with Private group' in text_content:
-                    reasons.append("✓ Has group marker")
-                if '·' in text_content:
-                    reasons.append("✓ Has separator")
-                if html_size > 30000:
-                    reasons.append(f"✓ Large HTML ({html_size})")
-                
-                # Check negative indicators
-                if 'aria-label="Loading"' in html_content:
-                    reasons.append("✗ Loading placeholder")
-                if text_content.endswith('LikeReply'):
-                    reasons.append("✗ Ends with LikeReply")
-                if html_size < 5000:
-                    reasons.append(f"✗ Small HTML ({html_size})")
-                
-                logger.info(f"Container {i+1}:")
-                logger.info(f"  Preview: {preview}")
-                logger.info(f"  Size: {html_size} bytes, {len(text_content)} chars")
-                logger.info(f"  Is Main Post: {is_main}")
-                logger.info(f"  Reasons: {', '.join(reasons) if reasons else 'None detected'}")
-                logger.info("")
-                
-            except Exception as e:
-                logger.info(f"Container {i+1}: Error - {str(e)[:50]}")
-                logger.info("")
+        for i, container in enumerate(all_containers[:15]):  # Check first 15
+            is_main, analysis = await self.debug_container_classification(container, i)
+            if is_main:
+                main_post_count += 1
+            logger.info("")  # Blank line between containers
         
         logger.info("=" * 60)
-        logger.info("End of debug inspection")
+        logger.info(f"SUMMARY: Found {main_post_count} main posts out of {min(15, len(all_containers))} containers")
         logger.info("=" * 60)
-
+    
 
     ###^ 5- CLEANUP AND SAVE FUNCTIONS
     
@@ -3234,7 +3328,7 @@ async def main():
             # Skip diagnosis for filtering modes to save time
             if filter_choice == '1':  # Only for "all posts" mode
                 print("\n🔍 Running container debug analysis...")
-                await scraper.debug_all_containers()
+                await scraper.debug_all_containers_enhanced()
                 
                 # Ask if they want to continue after seeing debug
                 continue_after_debug = input("\nContinue with scraping? (y/n): ").strip().lower()
