@@ -620,7 +620,7 @@ class FacebookGroupScraper:
             logger.warning("Not enough containers loaded to test container 6")
 
     async def scrape_with_thread_boundary_detection(self, num_posts=10):
-        """ENHANCED: Main scraping with LLM fallback and sequential container processing"""
+        """FINAL: Main scraping with true sequential processing - no container skipping"""
         logger.info(f"Starting scraping of {num_posts} posts")
         
         self.absolute_post_counter = 0
@@ -641,8 +641,9 @@ class FacebookGroupScraper:
                 
                 logger.debug(f"Total containers available: {total_containers}, starting from position {container_position}")
                 
+                # Only scroll when we've actually reached the end
                 if container_position >= total_containers:
-                    logger.info(f"Reached end of current containers ({total_containers}), scrolling for more...")
+                    logger.info(f"Reached end of all containers ({total_containers}), scrolling for more...")
                     await self.page.keyboard.press('End')
                     await asyncio.sleep(3)
                     scroll_attempts += 1
@@ -739,9 +740,7 @@ class FacebookGroupScraper:
                                     logger.info(f"Creating comprehensive debug dump for failed post...")
                                     await self.dump_failed_post_debug(container_data, post_data, i+1)
                             
-                            # CRITICAL FIX: Sequential processing instead of jumping to boundary
-                            # OLD: container_position = boundary_index  # This caused large jumps
-                            # NEW: container_position = i + 1  # Sequential container processing
+                            # CRITICAL: Sequential processing - advance to next container only
                             container_position = i + 1
                             
                             found_post = True
@@ -754,20 +753,17 @@ class FacebookGroupScraper:
                         logger.debug(f"Error checking container {i+1}: {str(e)[:50]}")
                         continue
                 
+                # CRITICAL FIX: When no posts found, advance by only 1 container, not batch_size
                 if not found_post:
-                    container_position = min(container_position + batch_size, total_containers)
-                    logger.debug(f"No posts found in batch, advancing to position {container_position}")
-                    
-                    if container_position >= total_containers - 10:
-                        logger.info("Near end of containers, scrolling for more...")
-                        await self.page.keyboard.press('End')
-                        await asyncio.sleep(3)
-                        scroll_attempts += 1
+                    # OLD PROBLEMATIC: container_position = min(container_position + batch_size, total_containers)
+                    # NEW SEQUENTIAL: Always advance by 1 container only
+                    container_position = min(container_position + 1, total_containers)
+                    logger.debug(f"No posts found in batch, advancing sequentially to position {container_position}")
                 
             except Exception as e:
                 logger.error(f"Error in scraping loop: {str(e)[:100]}")
                 scroll_attempts += 1
-                container_position += 2
+                container_position += 1  # Advance by 1 on error too
                 continue
         
         if failed_validations >= max_failed_validations:
@@ -778,6 +774,7 @@ class FacebookGroupScraper:
         logger.info(f"Completed scraping: {len(posts)} valid posts from {self.absolute_post_counter} total processed")
         logger.info(f"Checked {containers_checked} containers total")
         return posts
+
 
     async def process_post_with_llm_boundary_detection(self, containers, container_data, post_num):
         """Process post using LLM-enhanced boundary detection"""
