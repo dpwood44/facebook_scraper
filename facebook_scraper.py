@@ -1,6 +1,6 @@
 """
 Facebook Groups Scraper for Collectible Sales (GI Joe, etc.)
-Improved version with better data extraction and save reliability
+
 """
 
 import asyncio
@@ -185,7 +185,6 @@ class FacebookGroupScraper:
             logger.error(f"Navigation error: {e}")
             return False
 
-
     async def get_real_posts_only(self):
         """Get only real posts, filtering out virtualized placeholders - with logging"""
         logger.info("Finding real posts (filtering virtualized content)")
@@ -269,7 +268,6 @@ class FacebookGroupScraper:
             
         except Exception as e:
             print(f"  ⚠️ Error during post loading: {str(e)[:100]}")
- 
  
  
  
@@ -1073,7 +1071,8 @@ class FacebookGroupScraper:
 
 
     ###^ 2.1 - FORCE LOADING HELPERS
-
+    # region
+    
     async def force_load_hidden_posts(self):
         """Try to force load content in hidden containers"""
         print("  🔄 Attempting to force load hidden posts...")
@@ -1219,6 +1218,7 @@ class FacebookGroupScraper:
             print(f"    Force load error: {str(e)[:50]}")
             return False
 
+    # endregion
 
     ###^ 2.2 - IDENTIFICATION
 
@@ -1809,7 +1809,8 @@ class FacebookGroupScraper:
 
 
     ###^ 2.3 - SALE POST DETECTION
-
+    # region
+    
     def _init_sale_patterns(self):
         """Initialize sale detection patterns"""
         self.sale_keywords = {
@@ -1936,7 +1937,7 @@ class FacebookGroupScraper:
             'threshold_met': is_sale
         }
         
-        
+    # endregion 
 
     ###^ 3 - COMMENT SCRAPING
     # region
@@ -2561,7 +2562,7 @@ class FacebookGroupScraper:
 
     
     ###^ EXTRACTION METHODS - POST DATA & TEXT    
-    
+    # region
     async def extract_post_data_improved_fixed(self, post_element, post_num):
         """Improved post data extraction with better error handling and timeouts"""
         post_data = {
@@ -2721,9 +2722,10 @@ class FacebookGroupScraper:
         
         return full_text.strip()[:2000] if full_text else ""
 
-
+    # endregion
+    
     ###^ EXTRACTION METHODS - AUTHOR & TIME
-
+    # region
     async def extract_author_improved_fixed(self, post_element):
         """Improved author extraction with better timeout handling"""
         
@@ -2909,7 +2911,10 @@ class FacebookGroupScraper:
         return any(re.search(pattern, text_lower) for pattern in timestamp_patterns)
 
 
+    # endregion
+    
     ###^ EXTRACTION METHODS - IMAGES
+    # region
 
     async def extract_images_safe(self, post_element, post_id):
         """Extract images without clicking"""
@@ -2970,7 +2975,10 @@ class FacebookGroupScraper:
             print("      ⚠️ aiohttp/aiofiles not available for image downloads")
     
     
+    # endregion
+    
     ###^ EXTRACTION METHODS - COLLECTIBLE INFO
+    # region
     
     def extract_collectible_info(self, post_data):
         """Extract collectible/action figure specific information"""
@@ -3065,6 +3073,7 @@ class FacebookGroupScraper:
         
         return sale_info if sale_info else None
     
+    # endregion
     
     ###^ DIAGNOSICS METHODS
     
@@ -3094,205 +3103,6 @@ class FacebookGroupScraper:
             if sale_info.get('items'):
                 print(f"   🎯 Items: {', '.join(sale_info.get('items', [])[:3])}")
     
-    async def inspect_post_html(self, post_element, post_num):
-        """Inspect the HTML structure of a post to understand why it's failing"""
-        print(f"\n🔍 INSPECTING POST {post_num} HTML STRUCTURE")
-        print("=" * 60)
-        
-        try:
-            # Get the full HTML of the post
-            html_content = await post_element.inner_html()
-            
-            # Save HTML to file for inspection
-            html_file = self.output_dir / f"post_{post_num}_html.html"
-            with open(html_file, 'w', encoding='utf-8') as f:
-                f.write(f"<!-- Post {post_num} HTML Structure -->\n")
-                f.write(html_content)
-            print(f"📄 Full HTML saved to: {html_file}")
-            
-            # Show condensed HTML structure
-            print(f"\n📋 HTML Preview (first 500 chars):")
-            print("-" * 40)
-            print(html_content[:500])
-            print("..." if len(html_content) > 500 else "")
-            
-            # Test all our selectors and see what they find
-            print(f"\n🧪 TESTING SELECTORS:")
-            print("-" * 40)
-            
-            # Text selectors
-            text_selectors = [
-                'div[dir="auto"]',
-                'span[dir="auto"]', 
-                'div[data-ad-preview="message"]',
-                '[data-testid="post_message"]',
-                'div[lang]',
-                'p'
-            ]
-            
-            for selector in text_selectors:
-                try:
-                    elements = await post_element.locator(selector).all()
-                    print(f"📝 {selector}: {len(elements)} elements")
-                    
-                    # Show first few text samples
-                    for i, elem in enumerate(elements[:3]):
-                        try:
-                            text = await elem.text_content(timeout=1000)
-                            if text and len(text.strip()) > 5:
-                                print(f"    [{i}] {text[:60]}...")
-                        except:
-                            print(f"    [{i}] <timeout/error>")
-                            
-                except Exception as e:
-                    print(f"❌ {selector}: ERROR - {str(e)[:50]}")
-            
-            # Author selectors
-            print(f"\n👤 AUTHOR SELECTORS:")
-            author_selectors = [
-                'strong a',
-                'h3 a', 
-                'a[role="link"] strong',
-                'strong',
-                'h3',
-                '[data-hovercard-user-id] strong',
-                'a[data-hovercard-user-id]'
-            ]
-            
-            for selector in author_selectors:
-                try:
-                    elements = await post_element.locator(selector).all()
-                    print(f"👤 {selector}: {len(elements)} elements")
-                    
-                    for i, elem in enumerate(elements[:2]):
-                        try:
-                            text = await elem.text_content(timeout=1000)
-                            if text:
-                                print(f"    [{i}] {text[:40]}...")
-                        except:
-                            print(f"    [{i}] <timeout/error>")
-                            
-                except Exception as e:
-                    print(f"❌ {selector}: ERROR - {str(e)[:50]}")
-            
-            # Image selectors
-            print(f"\n📷 IMAGE SELECTORS:")
-            try:
-                img_elements = await post_element.locator('img').all()
-                print(f"📷 img: {len(img_elements)} elements")
-                
-                for i, img in enumerate(img_elements[:3]):
-                    try:
-                        src = await img.get_attribute('src', timeout=3000)
-                        alt = await img.get_attribute('alt', timeout=2000)
-                        print(f"    [{i}] src: {src[:50] if src else 'None'}...")
-                        print(f"    [{i}] alt: {alt[:40] if alt else 'None'}...")
-                    except:
-                        print(f"    [{i}] <timeout/error>")
-                        
-            except Exception as e:
-                print(f"❌ img: ERROR - {str(e)[:50]}")
-            
-            # Look for any data attributes that might help
-            print(f"\n🏷️  DATA ATTRIBUTES:")
-            try:
-                # Get all attributes of the post element
-                all_attrs = await post_element.evaluate('el => Array.from(el.attributes).map(attr => attr.name + "=" + attr.value)')
-                for attr in all_attrs[:10]:  # Show first 10 attributes
-                    if 'data-' in attr or 'aria-' in attr or 'role' in attr:
-                        print(f"    {attr[:80]}...")
-            except:
-                print("    <Could not get attributes>")
-            
-            print("=" * 60)
-            
-        except Exception as e:
-            print(f"❌ HTML inspection failed: {str(e)}")
-
-    # Enhanced diagnostic that combines everything
-    async def comprehensive_diagnosis(self):
-        """Run all diagnostic checks"""
-        await self.detailed_post_inspection()
-        await self.try_alternative_post_finding()
-        
-        # Final recommendation
-        print(f"\n=== RECOMMENDATIONS ===")
-        print("Based on the inspection above:")
-        print("1. Check which selector actually found posts with content")
-        print("2. Look at the HTML structure to understand the layout") 
-        print("3. Try manual browser inspection (F12) to compare")
-        print("4. Consider if Facebook has changed their layout recently")
-
-    async def detailed_post_inspection(self):
-        """Detailed inspection to understand post structure"""
-        print("\n=== DETAILED POST INSPECTION ===")
-        
-        # Try multiple post selectors
-        selectors_to_try = [
-            '[role="article"]',
-            'div[data-pagelet*="FeedUnit"]', 
-            'div[data-pagelet*="GroupFeedUnit"]',
-            'div[data-ft*="top_level_post_id"]',
-            'div[data-testid*="post"]',
-            '.userContentWrapper',
-            '._5pcr'  # Old Facebook class
-        ]
-        
-        for selector in selectors_to_try:
-            try:
-                elements = await self.page.locator(selector).all()
-                print(f"\n--- SELECTOR: {selector} ---")
-                print(f"Found: {len(elements)} elements")
-                
-                # Inspect first 3 elements in detail
-                for i in range(min(3, len(elements))):
-                    print(f"\nElement {i+1}:")
-                    try:
-                        elem = elements[i]
-                        
-                        # Get HTML structure preview
-                        html = await elem.inner_html()
-                        print(f"  HTML length: {len(html)}")
-                        print(f"  HTML preview: {html[:200]}...")
-                        
-                        # Get text content
-                        text = await elem.text_content()
-                        print(f"  Text length: {len(text) if text else 0}")
-                        if text:
-                            lines = text.split('\n')[:5]  # First 5 lines
-                            for j, line in enumerate(lines):
-                                if line.strip():
-                                    print(f"    Line {j+1}: {line.strip()[:100]}")
-                        
-                        # Check for specific elements
-                        has_imgs = await elem.locator('img').count()
-                        has_divs = await elem.locator('div').count()
-                        has_links = await elem.locator('a').count()
-                        print(f"  Contains: {has_imgs} imgs, {has_divs} divs, {has_links} links")
-                        
-                    except Exception as e:
-                        print(f"  Error inspecting element {i+1}: {str(e)[:100]}")
-                        
-            except Exception as e:
-                print(f"Selector {selector} failed: {str(e)[:100]}")
-        
-        # Also check what's actually visible on the page
-        print(f"\n--- PAGE CONTENT CHECK ---")
-        try:
-            page_text = await self.page.text_content()
-            print(f"Total page text length: {len(page_text) if page_text else 0}")
-            
-            if page_text:
-                # Look for patterns that suggest posts
-                lines = [line.strip() for line in page_text.split('\n') if line.strip()]
-                print("Sample visible text lines:")
-                for i, line in enumerate(lines[:20]):
-                    if len(line) > 20:  # Substantial content
-                        print(f"  {i+1}: {line[:100]}")
-                        
-        except Exception as e:
-            print(f"Page content check failed: {str(e)}")
-
     def print_sold_item_debug(self, post_data):
         """Enhanced debug output for sold items"""
         
@@ -3383,130 +3193,6 @@ class FacebookGroupScraper:
         
         print("")  # Blank line for readability
 
-    async def debug_container_classification(self, container, index):
-        """Detailed debug information for a single container"""
-        try:
-            html_content = await container.inner_html(timeout=2000)
-            text_content = await container.text_content(timeout=1500) or ""
-            html_size = len(html_content)
-            
-            # Get preview
-            preview = ' '.join(text_content.split()[:15])[:80]
-            
-            # Run detection
-            is_main = self.is_main_post_container(text_content, html_size)
-            
-            # Analyze specific patterns
-            analysis = {
-                'ends_with_likereply': text_content.endswith('LikeReply'),
-                'has_author_word': 'Author' in text_content,
-                'text_length': len(text_content),
-                'has_price': '$' in text_content,
-                'has_group_marker': 'Shared with Private group' in text_content,
-                'has_separator': 'Â·' in text_content,
-                'html_size': html_size,
-                'has_see_more': 'See more' in text_content,
-            }
-            
-            logger.info(f"Container {index + 1} DETAILED ANALYSIS:")
-            logger.info(f"  Preview: {preview}")
-            logger.info(f"  Classification: {'MAIN POST' if is_main else 'NOT MAIN POST'}")
-            logger.info(f"  Text length: {len(text_content)} chars")
-            logger.info(f"  HTML size: {html_size} bytes")
-            
-            # Show specific pattern matches
-            patterns_found = []
-            if analysis['ends_with_likereply']:
-                patterns_found.append("❌ ENDS WITH 'LikeReply' (COMMENT PATTERN)")
-            if analysis['has_author_word'] and len(text_content) < 150:
-                patterns_found.append("❌ Short text with 'Author' (COMMENT PATTERN)")
-            if analysis['has_price']:
-                patterns_found.append("✅ Has price ($)")
-            if analysis['has_group_marker']:
-                patterns_found.append("✅ Has group marker")
-            if analysis['has_separator']:
-                patterns_found.append("✅ Has separator (Â·)")
-            if analysis['html_size'] > 50000:
-                patterns_found.append("✅ Large HTML (>50k)")
-            if analysis['has_see_more']:
-                patterns_found.append("✅ Has 'See more'")
-                
-            for pattern in patterns_found:
-                logger.info(f"  {pattern}")
-                
-            return is_main, analysis
-            
-        except Exception as e:
-            logger.error(f"Debug analysis failed for container {index + 1}: {str(e)[:50]}")
-            return False, {}
-
-    async def debug_all_containers_structural(self):
-        """Enhanced debug showing structural pattern classification"""
-        logger.info("=" * 70)
-        logger.info("STRUCTURAL PATTERN DEBUG: Container Classification Analysis")
-        logger.info("=" * 70)
-        
-        all_containers = await self.page.locator('[role="article"]').all()
-        main_post_count = 0
-        comment_count = 0
-        uncertain_count = 0
-        
-        for i, container in enumerate(all_containers[:20]):  # Check first 20
-            try:
-                html_content = await container.inner_html(timeout=2000)
-                text_content = await container.text_content(timeout=1500) or ""
-                html_size = len(html_content)
-                
-                # Get preview
-                preview = ' '.join(text_content.split()[:12])[:70]
-                
-                # Run structural classification
-                classification = self._classify_by_structural_patterns(text_content)
-                
-                # Run old method for comparison
-                old_result = self._is_main_post_original_logic(text_content, html_size)
-                
-                # Count classifications
-                if classification['type'] == 'main_post':
-                    main_post_count += 1
-                elif classification['type'] == 'comment':
-                    comment_count += 1
-                else:
-                    uncertain_count += 1
-                
-                # Show detailed analysis
-                logger.info(f"Container {i+1}:")
-                logger.info(f"  Preview: {preview}{'...' if len(text_content) > 70 else ''}")
-                logger.info(f"  HTML Size: {html_size:,} bytes | Text Length: {len(text_content)} chars")
-                logger.info(f"  NEW Classification: {classification['type'].upper()} ({classification['confidence']}%)")
-                logger.info(f"  Reason: {classification['reason']}")
-                logger.info(f"  Final Decision: {'MAIN POST' if old_result else 'NOT MAIN POST'}")
-                
-                # Show specific pattern analysis
-                patterns_detected = self._analyze_specific_patterns(text_content)
-                if patterns_detected:
-                    logger.info(f"  Patterns: {' | '.join(patterns_detected)}")
-                
-                # Highlight potential issues
-                if classification['type'] == 'comment' and old_result:
-                    logger.warning(f"  ⚠️  CLASSIFICATION CHANGED: Was main post, now comment")
-                elif classification['type'] == 'main_post' and not old_result:
-                    logger.info(f"  📈 CLASSIFICATION IMPROVED: Was rejected, now main post")
-                
-                logger.info("")  # Blank line
-                
-            except Exception as e:
-                logger.error(f"Container {i+1}: Analysis failed - {str(e)[:50]}")
-                logger.info("")
-        
-        logger.info("=" * 70)
-        logger.info(f"CLASSIFICATION SUMMARY:")
-        logger.info(f"  Main Posts: {main_post_count}")
-        logger.info(f"  Comments: {comment_count}")
-        logger.info(f"  Uncertain: {uncertain_count}")
-        logger.info(f"  Total Analyzed: {min(20, len(all_containers))}")
-        logger.info("=" * 70)
-
     def _analyze_specific_patterns(self, text_content):
         """Analyze specific patterns for debug output"""
         if not text_content:
@@ -3549,76 +3235,6 @@ class FacebookGroupScraper:
         
         return patterns
 
-    async def test_problematic_post(self, test_text):
-        """Test the new classification on your problematic post"""
-        logger.info("=" * 50)
-        logger.info("TESTING PROBLEMATIC POST")
-        logger.info("=" * 50)
-        
-        # Your problematic post text
-        problematic_text = "Danielle Tansill ReynoldsAuthorStill available2dLikeReply"
-        
-        if test_text:
-            problematic_text = test_text
-        
-        logger.info(f"Testing: {problematic_text}")
-        logger.info("")
-        
-        # Run new classification
-        classification = self._classify_by_structural_patterns(problematic_text)
-        
-        # Show detailed breakdown
-        logger.info(f"Classification: {classification['type'].upper()}")
-        logger.info(f"Confidence: {classification['confidence']}%")
-        logger.info(f"Reason: {classification['reason']}")
-        logger.info("")
-        
-        # Check specific patterns
-        patterns = self._analyze_specific_patterns(problematic_text)
-        logger.info(f"Detected Patterns:")
-        for pattern in patterns:
-            logger.info(f"  {pattern}")
-        
-        if not patterns:
-            logger.info("  No specific patterns detected")
-        
-        logger.info("")
-        
-        # Test regex patterns individually
-        logger.info("Regex Pattern Tests:")
-        
-        # Comment pattern test
-        comment_pattern = re.search(r'^[A-Za-z\s]+Author[A-Za-z\s]*\d+[dwmyh].*(?:Like|Reply)$', problematic_text)
-        logger.info(f"  Comment Pattern Match: {'YES' if comment_pattern else 'NO'}")
-        
-        # UI ending test
-        ui_ending = problematic_text.endswith(('LikeReply', 'Reply', 'Like'))
-        logger.info(f"  Ends with UI: {'YES' if ui_ending else 'NO'}")
-        
-        # Author embedded test
-        author_embedded = 'Author' in problematic_text and len(problematic_text) < 200
-        logger.info(f"  Author Embedded: {'YES' if author_embedded else 'NO'}")
-        
-        logger.info("=" * 50)
-        
-        return classification['type'] == 'comment'
-
-    # Add this method to replace the debug call in main()
-    async def comprehensive_structural_debug(self):
-        """Run complete structural debugging"""
-        
-        # Test the problematic post first
-        logger.info("🧪 TESTING KNOWN PROBLEMATIC POST")
-        await self.test_problematic_post("Danielle Tansill ReynoldsAuthorStill available2dLikeReply")
-        
-        # Then run full container analysis
-        logger.info("🔍 ANALYZING ALL CONTAINERS")
-        await self.debug_all_containers_structural()
-        
-        # Show pattern statistics
-        logger.info("📊 PATTERN STATISTICS")
-        await self._show_pattern_statistics()
-    
     async def _show_pattern_statistics(self):
         """Show pattern detection statistics"""
         logger.info("=" * 50)
@@ -3716,62 +3332,6 @@ class FacebookGroupScraper:
             logger.error(f"Pattern statistics failed: {str(e)[:50]}")
             logger.info("=" * 50)
 
-    async def debug_boundary_detection(self, start_container=0, num_containers=40):
-        """Debug method to see boundary detection in action"""
-        logger.info("=" * 70)
-        logger.info("BOUNDARY DETECTION DEBUG")
-        logger.info("=" * 70)
-        
-        all_containers = await self.page.locator('[role="article"]').all()
-        
-        # Analyze containers to show boundary logic
-        for i in range(start_container, min(start_container + num_containers, len(all_containers))):
-            try:
-                container = all_containers[i]
-                html_content = await container.inner_html(timeout=1000)
-                text_content = await container.text_content(timeout=800) or ""
-                html_size = len(html_content)
-                
-                if html_size < 200:
-                    continue
-                
-                # Get preview
-                preview = ' '.join(text_content.split()[:12])[:80]
-                
-                # Run boundary detection
-                is_likely_main = self._is_likely_main_post_for_boundary(text_content, html_size)
-                
-                # Run full classification for comparison
-                classification = self._classify_by_structural_patterns(text_content)
-                
-                # Analyze signals
-                signals = self._analyze_boundary_signals(text_content, html_size)
-                
-                logger.info(f"Container {i+1}:")
-                logger.info(f"  Preview: {preview}{'...' if len(text_content) > 80 else ''}")
-                logger.info(f"  Size: {html_size:,} bytes | Text: {len(text_content)} chars")
-                logger.info(f"  Boundary Detection: {'MAIN POST' if is_likely_main else 'NOT MAIN POST'}")
-                logger.info(f"  Full Classification: {classification['type']} ({classification['confidence']}%)")
-                
-                # Show signals
-                if signals['positive_signals']:
-                    logger.info(f"  Positive Signals: {', '.join(signals['positive_signals'])}")
-                if signals['negative_signals']:
-                    logger.info(f"  Negative Signals: {', '.join(signals['negative_signals'])}")
-                
-                # Highlight mismatches
-                if is_likely_main and classification['type'] == 'comment':
-                    logger.warning(f"  ⚠️  MISMATCH: Boundary says main post, Classification says comment")
-                elif not is_likely_main and classification['type'] == 'main_post':
-                    logger.warning(f"  ⚠️  MISMATCH: Boundary says not main post, Classification says main post")
-                
-                logger.info("")
-                
-            except Exception as e:
-                logger.error(f"Container {i+1}: Error - {str(e)[:50]}")
-                logger.info("")
-        
-        logger.info("=" * 70)
 
     def _analyze_boundary_signals(self, text_content, html_size):
         """Analyze what signals are triggering boundary detection"""
@@ -4105,8 +3665,9 @@ class FacebookGroupScraper:
         except Exception as e:
             logger.error(f"Failed to create success dump: {str(e)}")
 
+
     ###^ 5- CLEANUP AND SAVE FUNCTIONS
-    
+    # region
     async def auto_save(self, posts_data=None):
         """Auto-save progress - with logging"""
         try:
@@ -4283,6 +3844,8 @@ class FacebookGroupScraper:
             logger.error(f"Error closing playwright: {str(e)}")
         
         logger.info("Cleanup complete - browser left open for your use")
+
+    # endregion
 
 
 def start_browser_with_debugging():
@@ -4508,7 +4071,7 @@ async def main():
             
             
             # How many posts?
-            num = input("\nNumber of posts to scrape (default 5): ").strip()
+            num = input("\nNumber of posts to scrape (default 10): ").strip()
             num_posts = int(num) if num else 10
             
             # Adjust expectations based on filtering mode
