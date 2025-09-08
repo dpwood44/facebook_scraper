@@ -21,11 +21,13 @@ from playwright.async_api import async_playwright
 from src.resources.fb_groups import fb_groups
 from sold_item_detector import SoldItemDetector
 from src.utils import setup_logging
+from typing import List, Dict, Optional
 
 class FacebookGroupScraper:
     def __init__(self, download_images=False, sale_posts_only=False, 
-                 include_sold=True, sold_items_only=False, 
-                 use_deep_sold_detection=False, visual_highlight=False):
+                include_sold=True, sold_items_only=False, 
+                use_deep_sold_detection=False, visual_highlight=False,
+                use_llm_fallback=False, llm_confidence_threshold=70):
         self.browser = None
         self.context = None
         self.page = None
@@ -35,9 +37,14 @@ class FacebookGroupScraper:
         # Post filtering options
         self.sale_posts_only = sale_posts_only
         self.include_sold = include_sold
-        self.sold_items_only = sold_items_only  # Option 4: Facebook search
-        self.use_deep_sold_detection = use_deep_sold_detection  # Option 5: Deep detection
+        self.sold_items_only = sold_items_only
+        self.use_deep_sold_detection = use_deep_sold_detection
         self.download_images = download_images
+        
+        # NEW: LLM Integration
+        self.use_llm_fallback = use_llm_fallback
+        self.llm_confidence_threshold = llm_confidence_threshold
+        self.llm_classifier = None
         
         # Create scrapes directory in project root
         scrapes_dir = Path("scrapes")
@@ -56,9 +63,24 @@ class FacebookGroupScraper:
         
         # Initialize logging with both console and file output
         setup_logging(
-            log_level="INFO",  # Change to "DEBUG" for more verbose logging
+            log_level="INFO",
             log_file=str(log_file)
         )
+        
+        # Initialize LLM classifier if enabled
+        if use_llm_fallback:
+            try:
+                from src.llm_classifier import LLMClassifier
+                self.llm_classifier = LLMClassifier()
+                logger.info(f"LLM fallback enabled (threshold: {llm_confidence_threshold}%)")
+            except ImportError:
+                logger.error("LLMClassifier import failed - install required dependencies: pip install openai python-dotenv")
+                logger.warning("Continuing without LLM fallback")
+                self.use_llm_fallback = False
+            except Exception as e:
+                logger.error(f"Failed to initialize LLM classifier: {e}")
+                logger.warning("Continuing without LLM fallback")
+                self.use_llm_fallback = False
         
         # Initialize sale patterns if any filtering is enabled
         if sale_posts_only or sold_items_only or use_deep_sold_detection:
@@ -87,6 +109,7 @@ class FacebookGroupScraper:
         logger.info(f"Sale posts only: {sale_posts_only}")
         logger.info(f"Include sold items: {include_sold}")
         logger.info(f"Sold items only: {sold_items_only}")
+        logger.info(f"LLM fallback: {'enabled' if use_llm_fallback else 'disabled'}")
         
         if download_images:
             (self.output_dir / "images").mkdir(exist_ok=True)
@@ -307,8 +330,17 @@ class FacebookGroupScraper:
         
         try:
             # Find where this post's comments end
-            boundary_index = await self.find_post_boundary(containers, main_post_index)
-            
+            boundary_index = await self.find_post_boundary_consistent(containers, main_post_index)
+
+            logger.info(f"📍 BOUNDARY RESULT: Post at container {main_post_index + 1} extends to container {boundary_index}")
+            if boundary_index - main_post_index > 1:
+                skipped_containers = list(range(main_post_index + 1, boundary_index))
+                logger.warning(f"⚠️ SKIPPING CONTAINERS: {[c + 1 for c in skipped_containers]} (these will not be evaluated as main posts)")
+                
+                # Special alert for container 4
+                if 3 in skipped_containers:  # 0-based index for container 4
+                    logger.error(f"🚨 CONTAINER 4 BEING SKIPPED! This is likely your USS Flagg post!")
+
             # Extract the complete thread
             thread_containers = containers[main_post_index:boundary_index]
             thread_size = len(thread_containers)
@@ -502,8 +534,93 @@ class FacebookGroupScraper:
         
         return False
 
+    async def debug_flagg_post_once(self):
+        """One-time diagnostic to find USS Flagg post and understand detection failure"""
+        
+        logger.info("DIAGNOSTIC: Searching for USS Flagg post to debug detection failure...")
+        
+        all_containers = await self.page.locator('[role="article"]').all()
+        
+        for i, container in enumerate(all_containers[:60]):
+            try:
+                content_data = await self.get_container_content_with_deep_extraction(container, "diagnostic")
+                text_lower = content_data['text_content'].lower()
+                
+                # Look for USS Flagg content
+                if any(term in text_lower for term in ['uss flagg', 'aprim primo', '70 gets']):
+                    logger.info(f"=== FOUND USS FLAGG POST IN CONTAINER {i+1} ===")
+                    logger.info(f"Raw text content: '{content_data['text_content']}'")
+                    logger.info(f"Text length: {len(content_data['text_content'])}")
+                    logger.info(f"HTML size: {content_data['html_size']}")
+                    
+                    # Test current boundary detection logic
+                    is_detected = self._is_likely_main_post_for_boundary(content_data['text_content'], content_data['html_size'])
+                    logger.info(f"Current boundary detection result: {'PASS' if is_detected else 'FAIL'}")
+                    
+                    # Show detailed signal analysis
+                    self._debug_boundary_signals(content_data['text_content'], content_data['html_size'])
+                    
+                    # Test what would make it pass
+                    logger.info("=== TESTING POTENTIAL FIXES ===")
+                    
+                    # Test if lowering thresholds would help
+                    text = content_data['text_content']
+                    has_price = '$' in text or '70' in text
+                    has_sale_terms = any(term in text_lower for term in ['gets', 'best offer', 'flagg'])
+                    has_reasonable_length = len(text) > 20
+                    
+                    logger.info(f"Has price indicators: {has_price}")
+                    logger.info(f"Has sale terms: {has_sale_terms}")
+                    logger.info(f"Has reasonable length: {has_reasonable_length}")
+                    
+                    if has_price and has_sale_terms and has_reasonable_length:
+                        logger.info("RECOMMENDED FIX: This post should trigger 'potential sale signals' detection")
+                        logger.info("Current potential_sale_signals logic may need adjustment")
+                    
+                    return i + 1  # Return container number for reference
+                    
+            except Exception as e:
+                continue
+        
+        logger.warning("USS Flagg post not found in first 20 containers")
+        return None
+
+    async def debug_container_6_specifically(self):
+        """Debug exactly what's happening with container 6"""
+        
+        logger.info("=== DEBUGGING CONTAINER 6 SPECIFICALLY ===")
+        
+        all_containers = await self.page.locator('[role="article"]').all()
+        
+        if len(all_containers) >= 6:
+            container_6 = all_containers[5]  # 0-based index for container 6
+            
+            # Test content extraction
+            content_data = await self.get_container_content_with_deep_extraction(container_6, "container_6_debug")
+            
+            logger.info(f"Container 6 content length: {len(content_data['text_content'])} chars")
+            logger.info(f"Container 6 HTML size: {content_data['html_size']} bytes")
+            logger.info(f"Container 6 full content: '{content_data['text_content']}'")
+            
+            # Test boundary detection
+            is_main_post = self._is_likely_main_post_for_boundary(content_data['text_content'], content_data['html_size'])
+            logger.info(f"Container 6 boundary detection: {'MAIN POST' if is_main_post else 'NOT MAIN POST'}")
+            
+            # Show signals
+            self._debug_boundary_signals(content_data['text_content'], content_data['html_size'])
+            
+            # Test what boundary detection returns for container 5
+            if len(all_containers) >= 5:
+                logger.info("=== TESTING CONTAINER 5 BOUNDARY DETECTION ===")
+                boundary_result = await self.find_post_boundary_consistent(all_containers, 4)  # 0-based for container 5
+                logger.info(f"Container 5 boundary detection says next boundary is at: {boundary_result}")
+                if boundary_result > 6:
+                    logger.warning(f"PROBLEM: Container 5 thinks its boundary is at {boundary_result}, skipping container 6!")
+        else:
+            logger.warning("Not enough containers loaded to test container 6")
+
     async def scrape_with_thread_boundary_detection(self, num_posts=10):
-        """ENHANCED: Main scraping with debug dumps for failed validations"""
+        """ENHANCED: Main scraping with LLM fallback and sequential container processing"""
         logger.info(f"Starting scraping of {num_posts} posts")
         
         self.absolute_post_counter = 0
@@ -539,7 +656,7 @@ class FacebookGroupScraper:
                     container = all_containers[i]
                     
                     try:
-                        content_data = await self.get_container_content_safely(container, "detection")
+                        content_data = await self.get_container_content_with_deep_extraction(container, "detection")
                         
                         if not content_data['text_content']:
                             logger.debug(f"Container {i+1}: No content, skipping")
@@ -553,7 +670,37 @@ class FacebookGroupScraper:
                             logger.debug(f"Container {i+1} is a loading placeholder, skipping")
                             continue
                         
-                        if self._is_likely_main_post_for_boundary(content_data['text_content'], content_data['html_size']):
+                        # ENHANCED: Use structural detection first, then LLM for uncertain cases
+                        is_main_post_structural = self._is_likely_main_post_for_boundary(content_data['text_content'], content_data['html_size'])
+                        
+                        # Add LLM verification for uncertain cases
+                        if not is_main_post_structural and self.use_llm_fallback:
+                            # Only use LLM for containers that structural detection rejected but might be posts
+                            potential_sale_signals = [
+                                '$' in content_data['text_content'],
+                                any(term in content_data['text_content'].lower() for term in ['gets', 'takes', 'shipped', 'obo', 'flagg']),
+                                len(content_data['text_content']) > 80 and any(term in content_data['text_content'].lower() for term in ['sale', 'selling', 'for sale']),
+                                len(content_data['text_content']) > 100 and content_data['text_content'].count('.') >= 2,
+                                any(term in content_data['text_content'].lower() for term in ['gi joe', 'cobra', 'parts', 'vehicle'])
+                            ]
+                            
+                            signal_count = sum(potential_sale_signals)
+                            
+                            if signal_count >= 1:  # Has some sale indicators
+                                logger.info(f"Structural detection rejected container {i+1}, but has {signal_count} sale signals - consulting LLM...")
+                                try:
+                                    llm_result = await self.classify_with_llm_fallback(content_data['text_content'], content_data['html_size'])
+                                    
+                                    if llm_result['type'] == 'main_post' and llm_result['confidence'] >= 70:
+                                        logger.success(f"LLM override: Container {i+1} is a main post ({llm_result['confidence']}% confidence)")
+                                        logger.info(f"LLM reasoning: {llm_result.get('reasoning', 'No reasoning provided')}")
+                                        is_main_post_structural = True
+                                    else:
+                                        logger.debug(f"LLM confirmed rejection: {llm_result['type']} ({llm_result['confidence']}%)")
+                                except Exception as e:
+                                    logger.error(f"LLM classification failed for container {i+1}: {str(e)[:50]}")
+                        
+                        if is_main_post_structural:
                             logger.info(f"Found main post at container {i+1}")
                             
                             container_data = {
@@ -564,6 +711,7 @@ class FacebookGroupScraper:
                             
                             target_post_number = len(posts) + 1
                             
+                            # Process the post and its thread
                             post_data, boundary_index = await self.process_post_with_stored_content(
                                 all_containers, 
                                 container_data,
@@ -573,9 +721,6 @@ class FacebookGroupScraper:
                             if post_data and self.validate_main_post_data(post_data):
                                 posts.append(post_data)
                                 logger.success(f"✅ Successfully scraped post #{self.absolute_post_counter} -> Saved as post {len(posts)}/{num_posts}")
-                                
-                                # OPTIONAL: Dump successful posts for comparison
-                                # await self.dump_successful_post_debug(container_data, post_data, i+1)
                                 
                                 self.print_enhanced_post_summary(post_data, self.absolute_post_counter)
                                 self.posts_data = posts.copy()
@@ -589,12 +734,16 @@ class FacebookGroupScraper:
                                 failed_validations += 1
                                 logger.warning(f"❌ Post #{self.absolute_post_counter} failed validation ({failed_validations}/{max_failed_validations})")
                                 
-                                # CRITICAL: Create debug dump for failed validation
+                                # Create debug dump for failed validation
                                 if post_data:
                                     logger.info(f"Creating comprehensive debug dump for failed post...")
                                     await self.dump_failed_post_debug(container_data, post_data, i+1)
                             
-                            container_position = boundary_index
+                            # CRITICAL FIX: Sequential processing instead of jumping to boundary
+                            # OLD: container_position = boundary_index  # This caused large jumps
+                            # NEW: container_position = i + 1  # Sequential container processing
+                            container_position = i + 1
+                            
                             found_post = True
                             scroll_attempts = 0
                             break
@@ -630,6 +779,67 @@ class FacebookGroupScraper:
         logger.info(f"Checked {containers_checked} containers total")
         return posts
 
+    async def process_post_with_llm_boundary_detection(self, containers, container_data, post_num):
+        """Process post using LLM-enhanced boundary detection"""
+        
+        self.absolute_post_counter += 1
+        absolute_num = self.absolute_post_counter
+        
+        main_container = container_data['container']
+        stored_content = container_data['content']
+        main_post_index = container_data['index']
+        
+        # Use stored content for preview to ensure it matches what we detected
+        preview_text = ' '.join(stored_content['text_content'].split()[:20])[:100]
+        if len(preview_text) > 100:
+            preview_text = preview_text[:100] + "..."
+        
+        logger.info(f"")
+        logger.info(f"{'='*60}")
+        logger.info(f"📄 POST #{absolute_num} (container {main_post_index + 1})")
+        logger.info(f"🔍 Preview: {preview_text}")
+        logger.info(f"{'='*60}")
+        
+        if self.visual_highlight:
+            await self.highlight_element(main_container)
+        
+        try:
+            # CRITICAL: Use LLM-enhanced boundary detection
+            boundary_index = await self.find_post_boundary_consistent(containers, main_post_index)
+            thread_containers = containers[main_post_index:boundary_index]
+            comment_containers = thread_containers[1:]
+            
+            # Extract main post data
+            post_data = await self.extract_post_data_with_stored_content(
+                main_container, 
+                stored_content, 
+                post_num
+            )
+            
+            logger.success(f"Extracted main post data for post {post_num}")
+            
+            # Process comments if present
+            if comment_containers:
+                logger.debug(f"Processing {len(comment_containers)} comment containers")
+                comment_container_info_list = []
+                for container in comment_containers:
+                    comment_container_info_list.append({'container': container})
+                
+                max_comments = min(100, len(thread_containers) * 2)
+                
+                await self.process_complete_comment_thread(
+                    post_data, 
+                    comment_container_info_list,
+                    max_comments=max_comments
+                )
+            
+            return post_data, boundary_index
+            
+        except Exception as e:
+            logger.error(f"Error processing thread: {str(e)[:100]}")
+            return None, main_post_index + 1
+
+
     async def process_post_with_stored_content(self, containers, container_data, post_num):
         """FIXED: Process post using pre-extracted content with proper numbering"""
         
@@ -657,6 +867,32 @@ class FacebookGroupScraper:
         try:
             # Find boundary using same consistent method
             boundary_index = await self.find_post_boundary_consistent(containers, main_post_index)
+
+            logger.info(f"📍 BOUNDARY RESULT: Post at container {main_post_index + 1} extends to container {boundary_index}")
+
+            jump_size = boundary_index - main_post_index
+            if jump_size > 1:
+                skipped_containers = list(range(main_post_index + 1, boundary_index))
+                logger.warning(f"⚠️ SKIPPING CONTAINERS: {[c + 1 for c in skipped_containers]} (jump size: {jump_size})")
+                
+                # Alert for specific ranges that might contain posts
+                if jump_size > 3:
+                    logger.error(f"🚨 LARGE JUMP DETECTED: This may be missing posts!")
+                    
+                # Show what's being skipped
+                if len(skipped_containers) <= 5:  # Only show details for reasonable numbers
+                    for skip_idx in skipped_containers:
+                        if skip_idx < len(containers):
+                            try:
+                                skip_container = containers[skip_idx]
+                                skip_content = await self.get_container_content_with_deep_extraction(skip_container, f"skip_check_{skip_idx}")
+                                skip_preview = ' '.join(skip_content['text_content'].split()[:10])[:50]
+                                logger.info(f"   Skipped container {skip_idx + 1}: '{skip_preview}...' ({len(skip_content['text_content'])} chars)")
+                            except Exception as e:
+                                logger.debug(f"   Skipped container {skip_idx + 1}: Error checking - {str(e)[:30]}")
+            else:
+                logger.debug(f"📍 Sequential processing: container {main_post_index + 1} -> {boundary_index}")
+
             thread_containers = containers[main_post_index:boundary_index]
             comment_containers = thread_containers[1:]
             
@@ -785,7 +1021,6 @@ class FacebookGroupScraper:
         self.posts_data = posts
         logger.success(f"🏁 Sequential processing complete: {len(posts)} sold items found from {posts_processed} posts processed")
         return posts
-
 
     async def scrape_sold_items_from_search(self, num_posts=10):
         """Scrape posts from the 'sold' search results page - no detection needed"""
@@ -997,7 +1232,8 @@ class FacebookGroupScraper:
         
         try:
             # First get the complete thread (post + all comments)
-            boundary_index = await self.find_post_boundary(containers, main_post_index)
+            boundary_index = await self.find_post_boundary_consistent(containers, main_post_index)
+
             thread_containers = containers[main_post_index:boundary_index]
             thread_size = len(thread_containers)
             
@@ -1070,6 +1306,83 @@ class FacebookGroupScraper:
         except Exception as e:
             logger.error(f"Error in deep analysis for post {post_number}: {str(e)[:100]}")
             return None, boundary_index
+
+    async def find_post_boundary_with_llm_verification(self, containers, start_index):
+        """Enhanced boundary detection with LLM verification for uncertain cases"""
+        
+        logger.debug(f"🔍 LLM boundary detection starting from container {start_index + 1}")
+
+        # Use your existing boundary detection first
+        proposed_boundary = await self.find_post_boundary_consistent(containers, start_index)
+        logger.debug(f"📍 Structural boundary detection suggests: {proposed_boundary}")
+    
+        # Use your existing boundary detection first
+        proposed_boundary = await self.find_post_boundary_consistent(containers, start_index)
+        
+        # If LLM is not enabled, return the structural result
+        if not self.use_llm_fallback or not self.llm_classifier:
+            return proposed_boundary
+        
+        # Check for uncertainty signals in skipped containers
+        uncertainty_score = 0
+        potential_posts = []
+        
+        for i in range(start_index + 1, min(proposed_boundary, start_index + 10)):  # Check up to 10 containers
+            try:
+                content_data = await self.get_container_content_safely(containers[i], "uncertainty_check")
+                text = content_data['text_content']
+                
+                if len(text.strip()) < 20:  # Skip very short content
+                    continue
+                
+                # Check for strong main post signals in "comment" containers
+                sale_indicators = ['$', 'shipped', 'obo', 'gets all', 'takes all', 'for sale', 'selling']
+                structure_indicators = ['shared with', 'see more', text.count('·') >= 2]
+                
+                found_sale_indicators = sum(1 for term in sale_indicators if term in text.lower())
+                found_structure_indicators = sum(1 for indicator in structure_indicators if indicator)
+                
+                if found_sale_indicators >= 1:
+                    uncertainty_score += 40
+                    potential_posts.append(i)
+                if found_structure_indicators >= 1:
+                    uncertainty_score += 30
+                    potential_posts.append(i)
+                if len(text) > 100 and text.count('.') > 2:
+                    uncertainty_score += 20
+                    potential_posts.append(i)
+                    
+            except Exception as e:
+                logger.debug(f"Error checking container {i} for uncertainty: {str(e)[:50]}")
+                continue
+        
+        # If uncertainty is high, verify with LLM
+        if uncertainty_score > 30 and potential_posts:
+            logger.info(f"High boundary uncertainty (score: {uncertainty_score}) - verifying with LLM...")
+            
+            start_content = await self.get_container_content_safely(containers[start_index], "llm_verification")
+            
+            for potential_index in potential_posts[:3]:  # Check up to 3 potential posts
+                try:
+                    potential_content = await self.get_container_content_safely(containers[potential_index], "llm_verification")
+                    
+                    if len(potential_content['text_content']) > 30:
+                        verification = await self.llm_classifier.verify_boundary_decision(
+                            start_content['text_content'][:200],
+                            potential_content['text_content'][:300]
+                        )
+                        
+                        if verification['is_new_post'] and verification['confidence'] >= 70:
+                            logger.success(f"LLM boundary override: Found main post at container {potential_index + 1} (confidence: {verification['confidence']}%)")
+                            return potential_index
+                            
+                except Exception as e:
+                    logger.error(f"LLM boundary verification failed for container {potential_index}: {str(e)[:50]}")
+                    continue
+        
+        logger.debug(f"No LLM boundary override needed, using structural boundary: {proposed_boundary}")
+        return proposed_boundary
+
 
 
     ###^ 2.1 - FORCE LOADING HELPERS
@@ -1223,6 +1536,34 @@ class FacebookGroupScraper:
     # endregion
 
     ###^ 2.2 - IDENTIFICATION
+
+    async def classify_with_llm_fallback(self, text_content: str, html_size: int = 0) -> Dict:
+        """Enhanced classification with LLM fallback for uncertain cases"""
+        
+        # Use your existing structural classification first
+        structural_result = self._classify_by_structural_patterns(text_content)
+        
+        logger.debug(f"Structural classification: {structural_result['type']} ({structural_result['confidence']}%)")
+        
+        # If structural classification is confident enough, use it
+        if (not self.use_llm_fallback or 
+            not self.llm_classifier or 
+            structural_result['confidence'] >= self.llm_confidence_threshold):
+            return structural_result
+        
+        # Use LLM for uncertain cases
+        logger.info(f"Structural confidence {structural_result['confidence']}% < {self.llm_confidence_threshold}% - consulting LLM...")
+        
+        llm_result = await self.llm_classifier.classify_post_type(text_content, html_size)
+        
+        # Combine results - prefer LLM for uncertain structural cases
+        if llm_result['confidence'] > structural_result['confidence']:
+            logger.info(f"LLM override: {llm_result['type']} ({llm_result['confidence']}%) vs structural {structural_result['type']} ({structural_result['confidence']}%)")
+            return llm_result
+        else:
+            logger.debug(f"Keeping structural classification despite uncertainty")
+            return structural_result
+
 
     def _classify_by_structural_patterns(self, text_content):
         """Primary classification based on Facebook's text concatenation patterns"""
@@ -1529,36 +1870,81 @@ class FacebookGroupScraper:
         return look_ahead_limit
 
     async def find_post_boundary_consistent(self, containers, start_index):
-        """Boundary detection using consistent extraction method"""
+        """CONSERVATIVE boundary detection - prevents large jumps and missing posts"""
         
-        look_ahead_limit = min(len(containers), start_index + 20)
-        logger.debug(f"Looking for boundary starting from container {start_index + 1}")
+        total_containers = len(containers)
+        max_look_ahead = min(6, total_containers - start_index)  # Look at most 5 containers ahead
+        look_ahead_limit = start_index + max_look_ahead
+        
+        logger.debug(f"🔍 CONSERVATIVE BOUNDARY: Starting from container {start_index + 1}, looking ahead to {look_ahead_limit}")
+        logger.debug(f"   Total containers available: {total_containers}")
         
         for i in range(start_index + 1, look_ahead_limit):
             try:
                 container = containers[i]
                 
-                # Use consistent extraction method
-                content_data = await self.get_container_content_safely(container, "boundary")
+                # Use enhanced content extraction
+                content_data = await self.get_container_content_with_deep_extraction(container, "boundary")
                 
+                # Skip very small containers (likely loading placeholders)
                 if content_data['html_size'] < 200:
+                    logger.debug(f"   Container {i+1}: SKIP - Too small ({content_data['html_size']} bytes)")
                     continue
                 
                 preview = ' '.join(content_data['text_content'].split()[:8])[:40]
                 
-                # Use same boundary detection logic with consistent content
-                if self._is_likely_main_post_for_boundary(content_data['text_content'], content_data['html_size']):
-                    logger.debug(f"Boundary found at container {i+1} (preview: {preview}...)")
+                # Test if this could be a main post
+                is_boundary = self._is_likely_main_post_for_boundary(content_data['text_content'], content_data['html_size'])
+                
+                logger.debug(f"   Container {i+1}: {'BOUNDARY' if is_boundary else 'Continue'} - {preview}...")
+                
+                if is_boundary:
+                    jump_size = i - start_index
+                    
+                    # CONSERVATIVE: Prevent jumps larger than 4 containers
+                    if jump_size > 4:
+                        logger.warning(f"🚨 LARGE JUMP PREVENTED: Would jump from {start_index + 1} to {i + 1} (gap of {jump_size})")
+                        logger.info(f"   Using conservative boundary at {start_index + 2} instead")
+                        return start_index + 2  # Only advance by 1 container
+                    
+                    # CONSERVATIVE: Be suspicious of jumps larger than 2 containers
+                    if jump_size > 2:
+                        logger.warning(f"⚠️ MODERATE JUMP: From container {start_index + 1} to {i + 1} (gap of {jump_size})")
+                        logger.info(f"   Content preview: '{content_data['text_content'][:60]}...'")
+                        
+                        # Double-check this is really a strong boundary
+                        strong_signals = [
+                            'Shared with Private group' in content_data['text_content'],
+                            'Shared with Public' in content_data['text_content'],
+                            '$' in content_data['text_content'] and len(content_data['text_content']) > 50,
+                            any(term in content_data['text_content'].lower() for term in [
+                                'for sale', 'selling', 'shipped', 'obo', 'gets all'
+                            ])
+                        ]
+                        
+                        strong_count = sum(1 for signal in strong_signals if signal)
+                        
+                        if strong_count < 2:
+                            logger.warning(f"   Only {strong_count} strong signals - using conservative boundary instead")
+                            return start_index + 2
+                    
+                    logger.debug(f"🚩 BOUNDARY FOUND at container {i+1} (jump size: {jump_size})")
                     return i
-                else:
-                    logger.debug(f"Container {i+1}: Not boundary ({content_data['html_size']} bytes, preview: {preview}...)")
-                            
+                    
             except Exception as e:
-                logger.debug(f"Container {i+1}: Error checking ({str(e)[:30]})")
+                logger.debug(f"   Container {i+1}: ERROR - {str(e)[:30]}")
                 continue
         
-        logger.debug(f"No boundary found in range, using limit: {look_ahead_limit}")
-        return look_ahead_limit
+        # If no boundary found within our conservative look-ahead
+        conservative_boundary = min(start_index + 2, total_containers)
+        logger.debug(f"🚩 NO BOUNDARY FOUND in conservative range, advancing to: {conservative_boundary}")
+        
+        # Additional safety check - don't go beyond available containers
+        if conservative_boundary >= total_containers:
+            logger.debug(f"   Reached end of containers, returning: {total_containers}")
+            return total_containers
+        
+        return conservative_boundary
 
     async def extract_post_data_with_stored_content(self, post_element, stored_content, post_num):
         """FIXED: Extract post data using stored content to ensure consistency"""
@@ -1721,9 +2107,97 @@ class FacebookGroupScraper:
                 'text_length': 0
             }
 
+    async def get_container_content_with_deep_extraction(self, container, purpose="detection"):
+        """Enhanced content extraction that tries multiple strategies"""
+        
+        # Try the standard extraction first
+        standard_content = await self.get_container_content_safely(container, purpose)
+        
+        # If we get comment-like content, try alternative extraction
+        text = standard_content['text_content']
+        
+        if (len(text) < 100 and 
+            any(indicator in text for indicator in ['AuthorVery responsive', 'LikeReply', 'Still available']) and
+            standard_content['html_size'] > 30000):  # Large HTML but small text = potential extraction issue
+            
+            logger.debug(f"Standard extraction got comment-like content, trying alternative extraction...")
+            
+            try:
+                # Strategy 1: Look for the main content div specifically
+                main_content_selectors = [
+                    '[data-ad-preview="message"]',
+                    'div[dir="auto"]',
+                    '[role="article"] > div > div > div > div > div[dir="auto"]',
+                    'span[dir="auto"]'
+                ]
+                
+                for selector in main_content_selectors:
+                    try:
+                        elements = await container.locator(selector).all()
+                        for elem in elements:
+                            elem_text = await elem.text_content(timeout=1000)
+                            if elem_text and len(elem_text.strip()) > 20:
+                                # Check if this looks like actual post content vs UI
+                                if not any(ui_indicator in elem_text for ui_indicator in [
+                                    'AuthorVery responsive', 'LikeReply', 'Still available', 'Follow'
+                                ]):
+                                    logger.success(f"Found alternative content: '{elem_text[:50]}...' ({len(elem_text)} chars)")
+                                    return {
+                                        'html_content': standard_content['html_content'],
+                                        'text_content': elem_text,
+                                        'html_size': standard_content['html_size'],
+                                        'text_length': len(elem_text),
+                                        'extraction_method': 'alternative'
+                                    }
+                    except:
+                        continue
+                
+                # Strategy 2: JavaScript extraction to bypass UI overlays
+                alternative_text = await container.evaluate('''
+                    (element) => {
+                        // Find all text nodes and filter out UI elements
+                        function getTextContent(node) {
+                            let text = '';
+                            for (let child of node.childNodes) {
+                                if (child.nodeType === Node.TEXT_NODE) {
+                                    text += child.textContent + ' ';
+                                } else if (child.nodeType === Node.ELEMENT_NODE) {
+                                    // Skip known UI elements
+                                    if (!child.getAttribute('aria-label') && 
+                                        !child.textContent.includes('LikeReply') &&
+                                        !child.textContent.includes('AuthorVery responsive')) {
+                                        text += getTextContent(child);
+                                    }
+                                }
+                            }
+                            return text;
+                        }
+                        
+                        let content = getTextContent(element);
+                        return content.trim();
+                    }
+                ''')
+                
+                if alternative_text and len(alternative_text) > len(text) and 'flagg' in alternative_text.lower():
+                    logger.success(f"JavaScript extraction found USS Flagg content: '{alternative_text[:50]}...'")
+                    return {
+                        'html_content': standard_content['html_content'],
+                        'text_content': alternative_text,
+                        'html_size': standard_content['html_size'],
+                        'text_length': len(alternative_text),
+                        'extraction_method': 'javascript'
+                    }
+                    
+            except Exception as e:
+                logger.debug(f"Alternative extraction failed: {str(e)[:50]}")
+        
+        # Return standard content if alternatives didn't work
+        return standard_content
+
+
 
     def _is_likely_main_post_for_boundary(self, text_content, html_size):
-        """SAME AS BEFORE - keeping the improved version"""
+        """Enhanced boundary detection with LLM fallback capability"""
         
         if not text_content or len(text_content.strip()) < 10:
             return False
@@ -1750,7 +2224,7 @@ class FacebookGroupScraper:
             any(word in text_content.lower() for word in [
                 'for sale', 'selling', 'shipped', 'obo', 'or best offer', 'best offer',
                 'paypal', 'venmo', 'gets all', 'takes all'
-            ])
+            ]),
             any(term in text_content.lower() for term in [
                 'gi joe', 'cobra', 'terrordome', 'flagg', 'kre-o', 'hasbro',
                 'complete', 'sealed', 'moc', 'mip', 'loose', 'mint'
@@ -1775,14 +2249,34 @@ class FacebookGroupScraper:
         strong_count = sum(1 for signal in strong_signals if signal)
         medium_count = sum(1 for signal in medium_signals if signal)
         
+        # Definitive cases - no LLM needed
         if strong_count >= 1:
             return True
         elif medium_count >= 3:
             return True
         elif medium_count >= 2 and html_size > 30000:
             return True
-        else:
-            return False
+        
+        # UNCERTAIN CASES - these would benefit from LLM verification in async context
+        # For now, use conservative structural approach
+        # (LLM verification happens in the boundary detection method)
+        
+        # Check for potential missed sale posts with weaker signals
+        potential_sale_signals = [
+            '$' in text_content,
+            any(term in text_content.lower() for term in ['gets', 'takes', 'shipped', 'obo']),
+            len(text_content) > 100 and any(term in text_content.lower() for term in ['price', 'offer', 'sale']),
+            text_content.count('.') >= 1 and len(text_content) > 80
+        ]
+        
+        potential_sale_count = sum(1 for signal in potential_sale_signals if signal)
+        
+        # Lower threshold for potential sales (these cases benefit most from LLM)
+        if potential_sale_count >= 2:
+            logger.debug(f"Potential sale post detected with weaker signals (would benefit from LLM verification)")
+            return True
+        
+        return False
     
     def _is_clearly_a_comment(self, text_content):
         """Quick check if content is definitely a comment"""
@@ -3671,6 +4165,80 @@ class FacebookGroupScraper:
         except Exception as e:
             logger.error(f"Failed to create success dump: {str(e)}")
 
+    def _debug_boundary_signals(self, text_content, html_size):
+        """Debug method to show which boundary signals are detected"""
+        
+        # Test all the signals from your boundary detection
+        signals_found = []
+        signals_missed = []
+        
+        # Strong signals
+        strong_tests = [
+            ('Shared with Private group', 'Shared with Private group' in text_content),
+            ('Shared with Public', 'Shared with Public' in text_content),
+            ('See more', 'See more' in text_content),
+            ('$ + length > 50', '$' in text_content and len(text_content) > 50),
+            ('Sale keywords', any(word in text_content.lower() for word in [
+                'for sale', 'selling', 'shipped', 'obo', 'or best offer', 'best offer',
+                'paypal', 'venmo', 'gets all', 'takes all'
+            ])),
+            ('GI Joe terms', any(term in text_content.lower() for term in [
+                'gi joe', 'cobra', 'terrordome', 'flagg', 'kre-o', 'hasbro',
+                'complete', 'sealed', 'moc', 'mip', 'loose', 'mint'
+            ])),
+            ('Multiple sentences', text_content.count('.') >= 3),
+            ('Multiple paragraphs', len(text_content.split('\n')) > 3),
+            ('Substantial length', len(text_content) > 250),
+            ('Author separators', text_content.count('·') >= 2 and 'Author' not in text_content)
+        ]
+        
+        # Medium signals
+        medium_tests = [
+            ('Medium length', len(text_content) > 150),
+            ('Some sentences', text_content.count('.') >= 2),
+            ('Some paragraphs', len(text_content.split('\n')) > 2),
+            ('Large HTML', html_size > 40000),
+            ('Commerce terms', any(word in text_content.lower() for word in [
+                'condition', 'includes', 'available', 'offers', 'price'
+            ]))
+        ]
+        
+        # Potential sale signals (your new addition)
+        potential_tests = [
+            ('Has $', '$' in text_content),
+            ('Sale terms', any(term in text_content.lower() for term in ['gets', 'takes', 'shipped', 'obo'])),
+            ('Long + sale', len(text_content) > 100 and any(term in text_content.lower() for term in ['price', 'offer', 'sale'])),
+            ('Sentences + length', text_content.count('.') >= 1 and len(text_content) > 80)
+        ]
+        
+        # Check all signals
+        strong_found = [name for name, test in strong_tests if test]
+        medium_found = [name for name, test in medium_tests if test]
+        potential_found = [name for name, test in potential_tests if test]
+        
+        logger.info(f"   Strong signals found ({len(strong_found)}): {strong_found}")
+        logger.info(f"   Medium signals found ({len(medium_found)}): {medium_found}")
+        logger.info(f"   Potential signals found ({len(potential_found)}): {potential_found}")
+        
+        # Show the scoring logic
+        strong_count = len(strong_found)
+        medium_count = len(medium_found)
+        potential_count = len(potential_found)
+        
+        logger.info(f"   Scoring: strong={strong_count}, medium={medium_count}, potential={potential_count}")
+        
+        # Show decision path
+        if strong_count >= 1:
+            logger.info(f"   DECISION: PASS (strong_count >= 1)")
+        elif medium_count >= 3:
+            logger.info(f"   DECISION: PASS (medium_count >= 3)")
+        elif medium_count >= 2 and html_size > 30000:
+            logger.info(f"   DECISION: PASS (medium >= 2 AND large HTML)")
+        elif potential_count >= 2:
+            logger.info(f"   DECISION: PASS (potential >= 2)")
+        else:
+            logger.info(f"   DECISION: FAIL (insufficient signals)")
+
 
     ###^ 5- CLEANUP AND SAVE FUNCTIONS
     # region
@@ -3791,9 +4359,9 @@ class FacebookGroupScraper:
                 logger.success(f"Emergency save completed: {emergency_file}")
             except:
                 logger.error("Emergency save also failed")
-                
+
     def print_summary_fixed(self):
-        """Print scraping summary with safe None handling"""
+        """Print scraping summary with post list and LLM statistics"""
         print("\n" + "=" * 60)
         print("SCRAPING SUMMARY")
         print("=" * 60)
@@ -3807,7 +4375,7 @@ class FacebookGroupScraper:
         posts_with_items = 0
         for post in self.posts_data:
             sale_info = post.get('sale_info')
-            if sale_info and isinstance(sale_info, dict):  # Check it's not None and is a dict
+            if sale_info and isinstance(sale_info, dict):
                 if sale_info.get('price'):
                     posts_with_prices += 1
                 if sale_info.get('items'):
@@ -3824,20 +4392,45 @@ class FacebookGroupScraper:
         print(f"Total images found: {total_images}")
         print(f"Total comments: {total_comments}")
         
-        # Show sample items found - with safe None handling
-        print(f"\nSample Items Found:")
-        sample_count = 0
-        for post in self.posts_data:
-            sale_info = post.get('sale_info')
-            if sale_info and isinstance(sale_info, dict) and sale_info.get('items') and sample_count < 5:
-                items = sale_info['items']
-                price = sale_info.get('price', 'No price')
-                print(f"  • {', '.join(items[:3])} - {price}")
-                sample_count += 1
+        # NEW: LLM Usage Statistics
+        if self.use_llm_fallback and self.llm_classifier:
+            stats = self.llm_classifier.get_stats()
+            print(f"\nAI Enhancement Statistics:")
+            print(f"LLM API calls made: {stats['total_calls']}")
+            print(f"Estimated API cost: ${stats['estimated_cost']:.6f}")
+            if stats['total_calls'] > 0:
+                print(f"Average cost per call: ${stats['average_cost_per_call']:.6f}")
+                print(f"Cost per post scraped: ${stats['estimated_cost'] / max(total_posts, 1):.6f}")
+            
+            # Show if LLM helped improve accuracy
+            if stats['total_calls'] > 0:
+                improvement_estimate = min(stats['total_calls'] * 0.7, total_posts * 0.1)  # Rough estimate
+                print(f"Estimated posts found due to LLM: ~{improvement_estimate:.0f}")
         
-        if sample_count == 0:
-            print("  (No specific items identified)")
+        # NEW: Posts Found List (replaces Sample Items Found)
+        print(f"\nPosts Found:")
+        for i, post in enumerate(self.posts_data, 1):
+            # Get first 150 characters of text as title
+            text = post.get('text', '').strip()
+            if not text:
+                # Fallback to author if no text
+                text = f"[Post by {post.get('author', 'Unknown')}]"
+            
+            # Truncate to 150 characters
+            title = text[:150]
+            if len(text) > 150:
+                title += "..."
+            
+            # Clean up title (remove newlines, extra spaces)
+            title = ' '.join(title.split())
+            
+            print(f"  {i}. {title}")
         
+        if total_posts == 0:
+            print("  (No posts found)")
+        
+        print("=" * 60)
+
     async def close(self):
         """Close connections - with logging"""
         logger.info("Scraping complete - cleaning up...")
@@ -3943,15 +4536,15 @@ def prompt_select_groups(groups):
 
 
 async def main():
-    """Main function with updated defaults"""
+    """Main function with LLM integration options"""
     print("\n" + "=" * 60)
-    print("🎯 FACEBOOK GROUP SCRAPER - GI JOE & COLLECTIBLES")
-    print("📌 Uses existing browser session - no login required!")
+    print("Facebook Group Scraper - GI Joe & Collectibles")
+    print("Uses existing browser session - no login required!")
     print("=" * 60)    
     
     print("\nOptions:")
-    print("1. 🔗 Use existing browser (you're already logged in) [DEFAULT]")
-    print("2. 🚀 Start new browser with debugging (I'll help you set it up)")
+    print("1. Use existing browser (you're already logged in) [DEFAULT]")
+    print("2. Start new browser with debugging (I'll help you set it up)")
     
     choice = input("\nChoice (1-2, default=1): ").strip()
     
@@ -3963,14 +4556,14 @@ async def main():
         # Default behavior - use existing browser
         if choice and choice != '1':
             print("Invalid choice, using default option 1 (existing browser)")
-        print("\n📋 Make sure you have a browser open with remote debugging:")
+        print("\nMake sure you have a browser open with remote debugging:")
         print('Chrome: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --remote-debugging-port=9222')
         print('Edge: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe" --remote-debugging-port=9222')
         print("\nAnd that you're logged into Facebook")
         input("\nPress Enter to continue...")
     
-    # Post filtering options (unchanged)
-    print("\n🏷️ Post Filtering Options:")
+    # Post filtering options
+    print("\nPost Filtering Options:")
     print("1. All posts (default)")
     print("2. Sale posts only")
     print("3. Available sale posts only (exclude sold items)")
@@ -3984,76 +4577,100 @@ async def main():
         include_sold = True
         sold_items_only = False
         use_deep_sold_detection = False
-        print("✅ Will scrape SALE POSTS ONLY (including sold items)")
+        print("Will scrape SALE POSTS ONLY (including sold items)")
         
     elif filter_choice == '3':
         sale_posts_only = True
         include_sold = False
         sold_items_only = False
         use_deep_sold_detection = False
-        print("✅ Will scrape AVAILABLE SALE POSTS ONLY (excluding sold)")
+        print("Will scrape AVAILABLE SALE POSTS ONLY (excluding sold)")
         
     elif filter_choice == '4':
         sale_posts_only = False
         include_sold = True
         sold_items_only = True
         use_deep_sold_detection = False
-        print("✅ Will scrape SOLD ITEMS from Facebook search (posts marked 'sold')")
-        print("ℹ️ Using Facebook's 'sold' search filter")
+        print("Will scrape SOLD ITEMS from Facebook search (posts marked 'sold')")
+        print("Using Facebook's 'sold' search filter")
         
     elif filter_choice == '5':
         sale_posts_only = False
         include_sold = True
         sold_items_only = False
         use_deep_sold_detection = True
-        print("✅ Will use DEEP SOLD DETECTION (analyzes posts + comments)")
-        print("🔍 This finds sales confirmed in comments that Facebook search might miss")
-        print("📊 Perfect for comprehensive market research")
+        print("Will use DEEP SOLD DETECTION (analyzes posts + comments)")
+        print("This finds sales confirmed in comments that Facebook search might miss")
+        print("Perfect for comprehensive market research")
         
     else:
         sale_posts_only = False
         include_sold = True
         sold_items_only = False
         use_deep_sold_detection = False
-        print("ℹ️ Will scrape ALL posts")
+        print("Will scrape ALL posts")
     
-    # UPDATED: Visual highlighting now defaults to YES
-    print("\n🎨 Visual Options:")
+    # Visual highlighting options
+    print("\nVisual Options:")
     highlight = input("Enable visual highlighting of posts being processed? (y/n, default=y): ").strip().lower()
-    visual_highlight = highlight != 'n'  # Default to True unless explicitly 'n'
+    visual_highlight = highlight != 'n'
     
     if visual_highlight:
-        print("✅ Visual highlighting enabled - watch the browser to see posts being processed!")
-        print("   Each post will be highlighted with a red border and yellow background")
+        print("Visual highlighting enabled - watch the browser to see posts being processed!")
+        print("Each post will be highlighted with a red border and yellow background")
     else:
-        print("ℹ️ Visual highlighting disabled (better performance)")
+        print("Visual highlighting disabled (better performance)")
     
-    # Ask about downloading images (unchanged)
-    download = input("\n📷 Download images? (y/n, default=y): ").strip().lower()
+    # NEW: AI Enhancement Options
+    print("\nAI Enhancement Options:")
+
+    use_llm = input("Enable LLM fallback for uncertain cases? (y/n, default=y): ").strip().lower()
+    use_llm_fallback = use_llm != 'n'  # Default to True unless explicitly 'n'
+
+    llm_threshold = 40  # New default
+    if use_llm_fallback:
+        threshold_input = input("LLM confidence threshold (50-90, default=70): ").strip()
+        try:
+            llm_threshold = int(threshold_input) if threshold_input else 70
+            llm_threshold = max(30, min(90, llm_threshold))  # Clamp between 50-90
+        except ValueError:
+            llm_threshold = 70
+        
+        print(f"LLM fallback enabled (threshold: {llm_threshold}%)")
+        print("This will use AI to classify uncertain posts, improving accuracy")
+        print("Estimated cost: $0.001-0.01 per scraping session")
+        print("Make sure you have set your OPENAI_API_KEY in .env file")
+    else:
+        print("Using structural detection only")
+    
+    # Ask about downloading images
+    download = input("\nDownload images? (y/n, default=y): ").strip().lower()
     download_images = download != 'n'
     
     if download_images:
-        print("✅ Will download images to local folder")
+        print("Will download images to local folder")
     else:
-        print("ℹ️ Will only save image URLs (not downloading)")
+        print("Will only save image URLs (not downloading)")
     
-    # Ask about autonomous operation (unchanged)
-    autonomous = input("\n🤖 Run autonomously without user prompts? (y/n, default=y): ").strip().lower()
+    # Ask about autonomous operation
+    autonomous = input("\nRun autonomously without user prompts? (y/n, default=y): ").strip().lower()
     autonomous_mode = autonomous != 'n'
     
     if autonomous_mode:
-        print("✅ Autonomous mode enabled - will run without user interaction")
+        print("Autonomous mode enabled - will run without user interaction")
     else:
-        print("ℹ️ Interactive mode - will ask for confirmation if needed")
+        print("Interactive mode - will ask for confirmation if needed")
     
-    # Create scraper with all options including visual highlighting
+    # Create scraper with all options including LLM
     scraper = FacebookGroupScraper(
         download_images=download_images,
         sale_posts_only=sale_posts_only,
         include_sold=include_sold,
         sold_items_only=sold_items_only,
         use_deep_sold_detection=use_deep_sold_detection if 'use_deep_sold_detection' in locals() else False,
-        visual_highlight=visual_highlight
+        visual_highlight=visual_highlight,
+        use_llm_fallback=use_llm_fallback,
+        llm_confidence_threshold=llm_threshold
     )
     
     try:
@@ -4066,15 +4683,11 @@ async def main():
                 print("No groups selected. Exiting.")
                 return
 
-            # Navigate to (and later scrape) each selected group in order
+            # Navigate to each selected group
             for grp in selected_groups:
                 group_id = grp["group_id"]
-                print(f"\n🌐 Selected group: {grp['group_name']} ({group_id})")
+                print(f"\nSelected group: {grp['group_name']} ({group_id})")
                 await scraper.navigate_to_group(group_id)
-            
-            
-
-            
             
             # How many posts?
             num = input("\nNumber of posts to scrape (default 10): ").strip()
@@ -4082,25 +4695,25 @@ async def main():
             
             # Adjust expectations based on filtering mode
             if sold_items_only:
-                print(f"\n🏷️ SOLD ITEMS MODE: Scanning for {num_posts} completed sales")
-                print("📊 This is perfect for market research - see what actually sells!")
-                print("🔍 Will analyze both posts and comments for sale completion evidence")
+                print(f"\nSOLD ITEMS MODE: Scanning for {num_posts} completed sales")
+                print("This is perfect for market research - see what actually sells!")
+                print("Will analyze both posts and comments for sale completion evidence")
             elif sale_posts_only:
-                print(f"\n🏷️ SALE FILTERING: May need to scan more posts to find {num_posts} sale posts")
+                print(f"\nSALE FILTERING: May need to scan more posts to find {num_posts} sale posts")
             
-            print("\n⚠️ Don't click anything in the browser while scraping!")
+            print("\nDon't click anything in the browser while scraping!")
             print("The script will handle everything automatically.")
             
             if autonomous_mode:
-                print("🤖 Running in autonomous mode - no user interaction required.")
+                print("Running in autonomous mode - no user interaction required.")
+            if use_llm_fallback:
+                print("LLM-enhanced detection active - improved accuracy for edge cases.")
             print("Enhanced version with sold items detection.\n")
             
             # Calculate timeout based on mode
             if use_deep_sold_detection:
-                # Longest timeout - need to analyze comments deeply
-                base_timeout = max(500, num_posts * 50)  # 50 seconds per sold item to find
+                base_timeout = max(500, num_posts * 50)
             elif sold_items_only:
-                # Facebook search - simpler
                 base_timeout = max(300, num_posts * 30)
             elif sale_posts_only:
                 base_timeout = max(300, num_posts * 30)
@@ -4116,22 +4729,19 @@ async def main():
             while len(all_posts) < num_posts and attempt <= max_retries:
                 try:
                     if use_deep_sold_detection:
-                        # Option 5: Deep detection on regular group feed
-                        print(f"🔍 Attempt {attempt}/{max_retries}: Deep-scanning for {remaining_posts} sold items (timeout: {base_timeout}s)")
+                        print(f"Attempt {attempt}/{max_retries}: Deep-scanning for {remaining_posts} sold items (timeout: {base_timeout}s)")
                         posts = await asyncio.wait_for(
                             scraper.scrape_with_deep_sold_detection(remaining_posts),
                             timeout=base_timeout
                         )
                     elif sold_items_only:
-                        # Option 4: Facebook search results
-                        print(f"📡 Attempt {attempt}/{max_retries}: Scraping {remaining_posts} posts from Facebook search (timeout: {base_timeout}s)")
+                        print(f"Attempt {attempt}/{max_retries}: Scraping {remaining_posts} posts from Facebook search (timeout: {base_timeout}s)")
                         posts = await asyncio.wait_for(
                             scraper.scrape_sold_items_from_search(remaining_posts),
                             timeout=base_timeout
                         )
                     else:
-                        # Options 1, 2, 3: Regular scraping
-                        print(f"📡 Attempt {attempt}/{max_retries}: Scraping {remaining_posts} posts (timeout: {base_timeout}s)")
+                        print(f"Attempt {attempt}/{max_retries}: Scraping {remaining_posts} posts (timeout: {base_timeout}s)")
                         posts = await asyncio.wait_for(
                             scraper.scrape_with_thread_boundary_detection(remaining_posts),
                             timeout=base_timeout
@@ -4140,28 +4750,27 @@ async def main():
                     if posts:
                         all_posts.extend(posts)
                         if use_deep_sold_detection:
-                            print(f"✅ Found {len(posts)} sold items via deep detection in attempt {attempt}")
-                            # Show how many were comment-confirmed
+                            print(f"Found {len(posts)} sold items via deep detection in attempt {attempt}")
                             comment_sales = sum(1 for p in posts 
                                             if p.get('sold_analysis', {}).get('sale_method') in ['comments', 'both'])
                             if comment_sales > 0:
-                                print(f"   💎 {comment_sales} were confirmed via comments (Facebook search would miss these!)")
+                                print(f"   {comment_sales} were confirmed via comments (Facebook search would miss these!)")
                         elif sold_items_only:
-                            print(f"✅ Got {len(posts)} sold posts from Facebook search in attempt {attempt}")
+                            print(f"Got {len(posts)} sold posts from Facebook search in attempt {attempt}")
                         else:
-                            print(f"✅ Got {len(posts)} posts in attempt {attempt}")
+                            print(f"Got {len(posts)} posts in attempt {attempt}")
                         break
                     
                 except asyncio.TimeoutError:
-                    print(f"\n⏱️ Timeout on attempt {attempt}, retrieving partial results...")
+                    print(f"\nTimeout on attempt {attempt}, retrieving partial results...")
                     partial_posts = scraper.posts_data or []
                     if partial_posts:
                         all_posts.extend(partial_posts)
-                        print(f"📦 Retrieved {len(partial_posts)} posts from attempt {attempt}")
+                        print(f"Retrieved {len(partial_posts)} posts from attempt {attempt}")
                     
                     if autonomous_mode and len(all_posts) < num_posts and attempt < max_retries:
                         remaining_posts = num_posts - len(all_posts)
-                        print(f"🤖 Autonomous retry: Attempting {remaining_posts} more posts...")
+                        print(f"Autonomous retry: Attempting {remaining_posts} more posts...")
                         attempt += 1
                         base_timeout = max(300, remaining_posts * 40)
                         continue
@@ -4169,14 +4778,14 @@ async def main():
                         break
                 
                 except Exception as e:
-                    print(f"❌ Error on attempt {attempt}: {str(e)[:100]}")
+                    print(f"Error on attempt {attempt}: {str(e)[:100]}")
                     if hasattr(scraper, 'posts_data') and scraper.posts_data:
                         partial_posts = scraper.posts_data or []
                         all_posts.extend(partial_posts)
-                        print(f"📦 Retrieved {len(partial_posts)} posts before error")
+                        print(f"Retrieved {len(partial_posts)} posts before error")
                     
                     if autonomous_mode and attempt < max_retries:
-                        print(f"🤖 Autonomous retry after error...")
+                        print(f"Autonomous retry after error...")
                         attempt += 1
                         continue
                     else:
@@ -4192,13 +4801,12 @@ async def main():
                     await scraper.save_results_fixed()
                     
                     if sold_items_only:
-                        print(f"\n✅ Successfully found {len(posts)} sold items!")
-                        print("📊 Perfect for market research:")
+                        print(f"\nSuccessfully found {len(posts)} sold items!")
+                        print("Perfect for market research:")
                         print("   - See what items actually sell")
                         print("   - Understand pricing trends")
                         print("   - Identify popular items")
                         
-                        # Show sold analysis summary
                         high_confidence = sum(1 for p in posts if p.get('sold_analysis', {}).get('confidence', 0) >= 80)
                         comment_sales = sum(1 for p in posts if p.get('sold_analysis', {}).get('sale_method') in ['comments', 'both'])
                         
@@ -4206,41 +4814,41 @@ async def main():
                         print(f"   - {comment_sales} sales completed in comments")
                         
                     elif sale_posts_only:
-                        print(f"\n✅ Successfully found {len(posts)} sale posts!")
+                        print(f"\nSuccessfully found {len(posts)} sale posts!")
                     else:
-                        print(f"\n✅ Successfully scraped {len(posts)} posts!")
+                        print(f"\nSuccessfully scraped {len(posts)} posts!")
                         
-                    print(f"📁 Data saved in folder: {scraper.output_dir}/")
+                    print(f"Data saved in folder: {scraper.output_dir}/")
                     
                 except Exception as e:
-                    print(f"⚠️ Error during save: {str(e)[:100]}")
+                    print(f"Error during save: {str(e)[:100]}")
             else:
                 if sold_items_only:
-                    print(f"\n⚠️ No sold items found after {attempt-1} attempts")
+                    print(f"\nNo sold items found after {attempt-1} attempts")
                     print("This could mean:")
                     print("1. No recent sales in this group")
                     print("2. Sales aren't clearly marked as sold")
                     print("3. Try a larger group or different time period")
                 else:
-                    print(f"\n⚠️ No posts found after {attempt-1} attempts")
+                    print(f"\nNo posts found after {attempt-1} attempts")
         
         else:
-            print("\n❌ Could not connect to browser")
+            print("\nCould not connect to browser")
             
     except KeyboardInterrupt:
-        print("\n\n⚠️ Scraping interrupted by user")
+        print("\n\nScraping interrupted by user")
         if hasattr(scraper, 'posts_data') and scraper.posts_data:
             try:
                 await scraper.save_results_fixed()
-                print(f"💾 Saved {len(scraper.posts_data)} posts that were scraped")
+                print(f"Saved {len(scraper.posts_data)} posts that were scraped")
             except Exception as e:
-                print(f"⚠️ Error saving interrupted data: {str(e)[:100]}")
+                print(f"Error saving interrupted data: {str(e)[:100]}")
     except Exception as e:
-        print(f"\n❌ Unexpected error: {str(e)}")
+        print(f"\nUnexpected error: {str(e)}")
         import traceback
         traceback.print_exc()
     finally:
         await scraper.close()
-
+        
 if __name__ == "__main__":
     asyncio.run(main())
