@@ -16,6 +16,7 @@ from datetime import datetime
 from loguru import logger
 from pathlib import Path
 
+from src.llm_classifier import LLMClassifier
 from playwright.async_api import async_playwright
 from src.resources.fb_groups import fb_groups
 from sold_item_detector import SoldItemDetector
@@ -268,6 +269,7 @@ class FacebookGroupScraper:
             
         except Exception as e:
             print(f"  ⚠️ Error during post loading: {str(e)[:100]}")
+ 
  
  
  
@@ -1719,6 +1721,7 @@ class FacebookGroupScraper:
                 'text_length': 0
             }
 
+
     def _is_likely_main_post_for_boundary(self, text_content, html_size):
         """SAME AS BEFORE - keeping the improved version"""
         
@@ -1745,8 +1748,9 @@ class FacebookGroupScraper:
             'See more' in text_content,
             '$' in text_content and len(text_content) > 50,
             any(word in text_content.lower() for word in [
-                'for sale', 'selling', 'shipped', 'obo', 'paypal', 'venmo'
-            ]),
+                'for sale', 'selling', 'shipped', 'obo', 'or best offer', 'best offer',
+                'paypal', 'venmo', 'gets all', 'takes all'
+            ])
             any(term in text_content.lower() for term in [
                 'gi joe', 'cobra', 'terrordome', 'flagg', 'kre-o', 'hasbro',
                 'complete', 'sealed', 'moc', 'mip', 'loose', 'mint'
@@ -1816,13 +1820,14 @@ class FacebookGroupScraper:
         self.sale_keywords = {
             'direct_sale': [
                 'for sale', 'fs:', 'wts:', 'want to sell', 'selling',
-                'price drop', 'reduced price', 'make offer', 'obo', 'or best offer',
-                'firm price', 'firm', 'take it', "i'll take", 'claim it', 'mine', 'pm sent', 'message sent'
+                'price drop', 'reduced price', 'make offer', 'obo', 'or best offer', 'best offer',
+                'firm price', 'firm', 'take it', "i'll take", 'claim it', 'mine', 'pm sent', 'message sent',
+                'gets all', 'takes all'  # ADDED
             ],
             'collectible_specific': [
                 'moc', 'mip', 'mib', 'mint on card', 'mint in package',
                 'loose', 'complete', 'incomplete', 'custom', 'vintage', 'rare',
-                'htf', 'hard to find', 'grail', 'holy grail'
+                'htf', 'hard to find', 'grail', 'holy grail', 'parts', 'accessories'  # ADDED parts/accessories
             ],
             'transaction': [
                 'shipped', 'shipping', 'plus shipping', 'free ship',
@@ -1841,6 +1846,7 @@ class FacebookGroupScraper:
             r'asking\s*:?\s*\$?\d+',         # asking $25, asking: 25
             r'price\s*:?\s*\$?\d+',          # price $25, price: 25
             r'\d+\s*(?:obo|firm|shipped|each)', # 25 obo, 100 firm
+            r'\b\d+\s*(?:gets|for|takes)',   # ADDED: 70 gets, 50 takes
         ]
         
         # Words that indicate NOT a sale post
@@ -1848,9 +1854,9 @@ class FacebookGroupScraper:
             'iso', 'in search of', 'looking for', 'wtb', 'want to buy',
             'wanted', 'need', 'seeking', 'anyone have', 'does anyone',
             'help me find', 'where can i', 'question', 'advice', 'opinion',
-        'thoughts', 'what do you think', 'should i', 'is this worth',
-        'just got', 'just arrived', 'mail call', 'collection update',
-        'haul', 'found at'
+            'thoughts', 'what do you think', 'should i', 'is this worth',
+            'just got', 'just arrived', 'mail call', 'collection update',
+            'haul', 'found at'
         ]
             
         logger.info(f"Sale detection patterns initialized")
