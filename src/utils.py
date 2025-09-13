@@ -1,6 +1,6 @@
 """
-Utility functions for the Facebook scraper project.
-Contains common helper functions used across the application.
+Enhanced utility functions for the Facebook scraper project.
+Contains common helper functions used across the application with improved logging.
 """
 
 import os
@@ -8,45 +8,140 @@ import json
 import csv
 import time
 import random
+import logging
+import sys
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Union
 from urllib.parse import urlparse, parse_qs
 import pandas as pd
-from loguru import logger
+from loguru import logger as loguru_logger
 
 
-def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> None:
+def setup_enhanced_logging(log_level: str = "DEBUG", log_file: Optional[str] = None) -> None:
     """
-    Set up logging configuration with loguru.
+    Enhanced logging setup that captures all modules consistently.
     
     Args:
-        log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+        log_level: Logging level for console output (DEBUG, INFO, WARNING, ERROR, CRITICAL)  
         log_file: Optional log file path. If None, only logs to console.
     """
-    # Remove default logger
-    logger.remove()
+    # Remove default loguru logger
+    loguru_logger.remove()
     
-    # Add console logger with colors
-    logger.add(
-        sink=lambda msg: print(msg, end=""),
+    # Add console logger with enhanced format
+    loguru_logger.add(
+        sink=sys.stdout,
         level=log_level,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-        colorize=True
+        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | <level>{message}</level>",
+        colorize=True,
+        enqueue=True,  # Thread-safe for async operations
+        catch=True     # Catch exceptions in logging
     )
     
-    # Add file logger if specified
+    # Add file logger with comprehensive detail (always DEBUG level)
     if log_file:
-        logger.add(
+        # Ensure log directory exists
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        loguru_logger.add(
             log_file,
-            level=log_level,
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
-            rotation="10 MB",
-            retention="7 days",
-            compression="zip"
+            level="DEBUG",  # Always capture all details to file
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {process.name}:{thread.name} | {extra} | {message}",
+            rotation="50 MB",
+            retention="10 days", 
+            compression="zip",
+            enqueue=True,
+            catch=True
         )
     
-    logger.info(f"Logging setup complete. Level: {log_level}")
+    # Bridge standard logging to loguru for module consistency
+    class InterceptHandler(logging.Handler):
+        def emit(self, record):
+            # Get corresponding Loguru level if it exists
+            try:
+                level = loguru_logger.level(record.levelname).name
+            except ValueError:
+                level = record.levelno
+
+            # Find caller from where originated the logged message
+            frame, depth = logging.currentframe(), 2
+            while frame and frame.f_code.co_filename == logging.__file__:
+                frame = frame.f_back
+                depth += 1
+
+            loguru_logger.opt(depth=depth, exception=record.exc_info).log(
+                level, record.getMessage()
+            )
+
+    # Replace all standard logging handlers with our interceptor
+    logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+    
+    # Ensure all existing loggers use our handler
+    for name in logging.root.manager.loggerDict:
+        logger = logging.getLogger(name)
+        logger.handlers = []
+        logger.propagate = True
+    
+    # Set specific levels for noisy third-party libraries
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("selenium").setLevel(logging.WARNING)
+    logging.getLogger("playwright").setLevel(logging.WARNING)
+    
+    loguru_logger.info(f"Enhanced logging setup complete. Console: {log_level}, File: {'DEBUG' if log_file else 'None'}")
+
+
+def get_module_logger(module_name: str):
+    """
+    Get a properly configured logger for any module with context binding.
+    
+    Args:
+        module_name: Usually __name__ from the calling module
+        
+    Returns:
+        Loguru logger instance with module context
+    """
+    return loguru_logger.bind(module=module_name)
+
+
+def create_scraper_logger(session_id: str, module_name: str, **extra_context):
+    """
+    Create a logger specifically for scraper components with rich context.
+    
+    Args:
+        session_id: Scraping session identifier
+        module_name: Module name (usually __name__)
+        **extra_context: Additional context to bind to logger
+        
+    Returns:
+        Loguru logger with scraper context
+    """
+    context = {
+        'session_id': session_id,
+        'module': module_name,
+        **extra_context
+    }
+    return loguru_logger.bind(**context)
+
+
+def log_method_entry(func_name: str, **kwargs):
+    """Log method entry with parameters for debugging."""
+    params = ', '.join(f"{k}={v}" for k, v in kwargs.items())
+    loguru_logger.debug(f"ENTER: {func_name}({params})")
+
+
+def log_method_exit(func_name: str, result=None, duration_ms: Optional[float] = None):
+    """Log method exit with result and timing."""
+    timing = f" [{duration_ms:.1f}ms]" if duration_ms else ""
+    result_str = f" -> {type(result).__name__}" if result is not None else ""
+    loguru_logger.debug(f"EXIT: {func_name}{result_str}{timing}")
+
+
+def log_performance_metric(operation: str, duration_ms: float, **metrics):
+    """Log performance metrics for analysis."""
+    metric_str = ', '.join(f"{k}={v}" for k, v in metrics.items())
+    loguru_logger.info(f"PERF: {operation} completed in {duration_ms:.1f}ms | {metric_str}")
 
 
 def validate_url(url: str) -> bool:
@@ -93,7 +188,7 @@ def random_delay(min_seconds: float = 1.0, max_seconds: float = 3.0) -> None:
         max_seconds: Maximum delay in seconds
     """
     delay = random.uniform(min_seconds, max_seconds)
-    logger.debug(f"Sleeping for {delay:.2f} seconds")
+    loguru_logger.debug(f"Random delay: {delay:.2f}s")
     time.sleep(delay)
 
 
@@ -121,13 +216,13 @@ def ensure_directory_exists(directory_path: Union[str, Path]) -> Path:
     """
     path = Path(directory_path)
     path.mkdir(parents=True, exist_ok=True)
-    logger.debug(f"Directory ensured: {path}")
+    loguru_logger.debug(f"Directory ensured: {path}")
     return path
 
 
 def save_json(data: Any, filepath: Union[str, Path], indent: int = 2) -> None:
     """
-    Save data to a JSON file.
+    Save data to a JSON file with logging.
     
     Args:
         data: Data to save
@@ -137,15 +232,21 @@ def save_json(data: Any, filepath: Union[str, Path], indent: int = 2) -> None:
     filepath = Path(filepath)
     ensure_directory_exists(filepath.parent)
     
-    with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=indent, ensure_ascii=False, default=str)
-    
-    logger.info(f"Data saved to JSON: {filepath}")
+    try:
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=indent, ensure_ascii=False, default=str)
+        
+        file_size = filepath.stat().st_size
+        loguru_logger.info(f"JSON saved: {filepath} ({file_size:,} bytes)")
+        
+    except Exception as e:
+        loguru_logger.error(f"Failed to save JSON to {filepath}: {e}")
+        raise
 
 
 def load_json(filepath: Union[str, Path]) -> Any:
     """
-    Load data from a JSON file.
+    Load data from a JSON file with logging.
     
     Args:
         filepath: Path to JSON file
@@ -155,19 +256,25 @@ def load_json(filepath: Union[str, Path]) -> Any:
     """
     filepath = Path(filepath)
     if not filepath.exists():
-        logger.error(f"JSON file not found: {filepath}")
+        loguru_logger.error(f"JSON file not found: {filepath}")
         return None
     
-    with open(filepath, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    
-    logger.info(f"Data loaded from JSON: {filepath}")
-    return data
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        file_size = filepath.stat().st_size
+        loguru_logger.info(f"JSON loaded: {filepath} ({file_size:,} bytes)")
+        return data
+        
+    except Exception as e:
+        loguru_logger.error(f"Failed to load JSON from {filepath}: {e}")
+        return None
 
 
 def save_csv(data: List[Dict], filepath: Union[str, Path], fieldnames: Optional[List[str]] = None) -> None:
     """
-    Save data to a CSV file.
+    Save data to a CSV file with logging.
     
     Args:
         data: List of dictionaries to save
@@ -175,7 +282,7 @@ def save_csv(data: List[Dict], filepath: Union[str, Path], fieldnames: Optional[
         fieldnames: Optional list of field names for column order
     """
     if not data:
-        logger.warning("No data to save to CSV")
+        loguru_logger.warning("No data to save to CSV")
         return
     
     filepath = Path(filepath)
@@ -184,17 +291,23 @@ def save_csv(data: List[Dict], filepath: Union[str, Path], fieldnames: Optional[
     if fieldnames is None:
         fieldnames = list(data[0].keys())
     
-    with open(filepath, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(data)
-    
-    logger.info(f"Data saved to CSV: {filepath} ({len(data)} rows)")
+    try:
+        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(data)
+        
+        file_size = filepath.stat().st_size
+        loguru_logger.info(f"CSV saved: {filepath} ({len(data)} rows, {file_size:,} bytes)")
+        
+    except Exception as e:
+        loguru_logger.error(f"Failed to save CSV to {filepath}: {e}")
+        raise
 
 
 def load_csv(filepath: Union[str, Path]) -> List[Dict]:
     """
-    Load data from a CSV file.
+    Load data from a CSV file with logging.
     
     Args:
         filepath: Path to CSV file
@@ -204,15 +317,21 @@ def load_csv(filepath: Union[str, Path]) -> List[Dict]:
     """
     filepath = Path(filepath)
     if not filepath.exists():
-        logger.error(f"CSV file not found: {filepath}")
+        loguru_logger.error(f"CSV file not found: {filepath}")
         return []
     
-    with open(filepath, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        data = list(reader)
-    
-    logger.info(f"Data loaded from CSV: {filepath} ({len(data)} rows)")
-    return data
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            data = list(reader)
+        
+        file_size = filepath.stat().st_size
+        loguru_logger.info(f"CSV loaded: {filepath} ({len(data)} rows, {file_size:,} bytes)")
+        return data
+        
+    except Exception as e:
+        loguru_logger.error(f"Failed to load CSV from {filepath}: {e}")
+        return []
 
 
 def clean_text(text: str) -> str:
@@ -268,54 +387,9 @@ def create_data_filename(prefix: str, extension: str = "json") -> str:
     return f"{prefix}_{timestamp}.{extension}"
 
 
-def safe_get_element_text(element, default: str = "") -> str:
-    """
-    Safely get text from a web element.
-    
-    Args:
-        element: Selenium WebElement or None
-        default: Default value if element is None or has no text
-        
-    Returns:
-        Element text or default value
-    """
-    try:
-        if element is None:
-            return default
-        text = element.text.strip()
-        return clean_text(text) if text else default
-    except Exception as e:
-        logger.warning(f"Error getting element text: {e}")
-        return default
-
-
-def parse_facebook_url(url: str) -> Dict[str, Any]:
-    """
-    Parse a Facebook URL to extract useful information.
-    
-    Args:
-        url: Facebook URL to parse
-        
-    Returns:
-        Dictionary with parsed URL components
-    """
-    parsed = urlparse(url)
-    query_params = parse_qs(parsed.query)
-    
-    return {
-        'full_url': url,
-        'path': parsed.path,
-        'query_params': query_params,
-        'is_profile': '/profile.php' in parsed.path or parsed.path.count('/') == 1,
-        'is_post': '/posts/' in parsed.path,
-        'is_photo': '/photo/' in parsed.path,
-        'is_video': '/videos/' in parsed.path,
-    }
-
-
 def retry_on_exception(max_retries: int = 3, delay: float = 1.0, backoff_factor: float = 2.0):
     """
-    Decorator to retry a function on exception.
+    Decorator to retry a function on exception with logging.
     
     Args:
         max_retries: Maximum number of retry attempts
@@ -330,10 +404,10 @@ def retry_on_exception(max_retries: int = 3, delay: float = 1.0, backoff_factor:
                     return func(*args, **kwargs)
                 except Exception as e:
                     if attempt == max_retries:
-                        logger.error(f"Function {func.__name__} failed after {max_retries} retries: {e}")
+                        loguru_logger.error(f"Function {func.__name__} failed after {max_retries} retries: {e}")
                         raise
                     
-                    logger.warning(f"Attempt {attempt + 1} failed for {func.__name__}: {e}. Retrying in {current_delay}s...")
+                    loguru_logger.warning(f"Attempt {attempt + 1}/{max_retries + 1} failed for {func.__name__}: {e}. Retrying in {current_delay}s...")
                     time.sleep(current_delay)
                     current_delay *= backoff_factor
             
@@ -355,7 +429,7 @@ def get_project_root() -> Path:
 
 def setup_data_directories() -> Dict[str, Path]:
     """
-    Set up and return data directories.
+    Set up and return data directories with logging.
     
     Returns:
         Dictionary of data directory paths
@@ -366,11 +440,14 @@ def setup_data_directories() -> Dict[str, Path]:
         'raw': root / 'data' / 'raw',
         'processed': root / 'data' / 'processed',
         'logs': root / 'logs',
+        'models': root / 'models',
+        'scrapes': root / 'scrapes',
     }
     
     for name, path in directories.items():
         ensure_directory_exists(path)
     
+    loguru_logger.debug(f"Data directories setup: {list(directories.keys())}")
     return directories
 
 
@@ -387,5 +464,5 @@ COMMON_SELECTORS = {
 }
 
 
-# Initialize logging when module is imported
-setup_logging()
+# Global logger for module-level functions
+module_logger = get_module_logger(__name__)

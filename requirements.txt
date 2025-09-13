@@ -1,5 +1,40 @@
-greenlet==3.0.3
-playwright==1.46.0
-pyee==11.1.0
-python-dotenv==1.0.1
-typing_extensions==4.12.2
+# Web Scraping & Browser Automation
+playwright==1.40.0
+beautifulsoup4==4.12.2
+
+# Async/HTTP Libraries  
+aiohttp==3.9.1
+aiofiles==23.2.0
+asyncio-throttle==1.0.2
+
+# Machine Learning Core
+numpy==1.24.4
+scikit-learn==1.3.2
+pandas==2.1.4
+
+# ML Models
+xgboost==2.0.2
+lightgbm==4.1.0
+
+# OpenAI Integration
+openai==1.6.1
+python-dotenv==1.0.0
+
+# Logging & Utilities
+loguru==0.7.2
+pathlib2==2.3.7
+tqdm==4.66.1
+
+# Data Processing
+regex==2023.10.3
+python-dateutil==2.8.2
+
+# Optional: Image Processing (if needed)
+Pillow==10.1.0
+
+# Optional: Data Export
+openpyxl==3.1.2
+
+# Development & Testing (optional)
+pytest==7.4.3
+jupyter==1.0.0

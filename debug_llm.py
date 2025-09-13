@@ -1,13 +1,81 @@
-"""
+# Create a debug script to find and fix the LLM classifier issue
+
+# debug_llm.py
+import sys
+from pathlib import Path
+
+def find_llm_classifier_issue():
+    """Find the LLM classifier initialization issue"""
+    
+    llm_file = Path("src/llm_classifier.py")
+    
+    if not llm_file.exists():
+        print("LLM classifier file not found. Let's create a simple one.")
+        create_simple_llm_classifier()
+        return
+    
+    # Read the file
+    with open(llm_file, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # Look for the problematic proxies parameter
+    if 'proxies=' in content:
+        print("Found 'proxies=' parameter in LLM classifier")
+        print("This is causing the initialization error")
+        
+        # Show the problematic line
+        lines = content.split('\n')
+        for i, line in enumerate(lines):
+            if 'proxies=' in line:
+                print(f"Line {i+1}: {line.strip()}")
+        
+        # Create fixed version
+        fix_llm_classifier(content)
+    else:
+        print("No 'proxies=' parameter found. The issue might be elsewhere.")
+        print("Let's create a simple working LLM classifier.")
+        create_simple_llm_classifier()
+
+def fix_llm_classifier(content):
+    """Fix the LLM classifier by removing proxies parameter"""
+    
+    # Remove proxies parameter
+    fixed_content = content.replace('proxies=', '#proxies=')
+    
+    # Also remove any other problematic parameters
+    problematic_patterns = [
+        'proxies=None',
+        'proxies={}',
+        'proxies=self.proxies',
+    ]
+    
+    for pattern in problematic_patterns:
+        fixed_content = fixed_content.replace(pattern, f'#{pattern}')
+    
+    # Backup original
+    backup_file = Path("src/llm_classifier.py.backup")
+    with open(backup_file, 'w', encoding='utf-8') as f:
+        f.write(content)
+    print(f"Created backup: {backup_file}")
+    
+    # Write fixed version
+    with open("src/llm_classifier.py", 'w', encoding='utf-8') as f:
+        f.write(fixed_content)
+    print("Fixed LLM classifier by commenting out proxies parameter")
+
+def create_simple_llm_classifier():
+    """Create a simple working LLM classifier"""
+    
+    llm_content = '''"""
 Simple LLM Classifier for Facebook post detection
-Fixed for OpenAI 1.40.0 compatibility
+Compatible with OpenAI 1.3.7
 """
 
 import os
 import asyncio
 from typing import Dict, Any
+import openai
 from openai import AsyncOpenAI
-import sys
 
 class LLMClassifier:
     """Simple LLM classifier for Facebook post detection"""
@@ -20,15 +88,8 @@ class LLMClassifier:
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable not set")
         
-        # Initialize OpenAI client with minimal parameters for 1.40.0 compatibility
-        try:
-            self.client = AsyncOpenAI(
-                api_key=api_key,
-                timeout=30.0  # Add explicit timeout
-            )
-        except Exception as e:
-            # Fallback initialization for older versions
-            self.client = AsyncOpenAI(api_key=api_key)
+        # Initialize OpenAI client (no proxies parameter)
+        self.client = AsyncOpenAI(api_key=api_key)
         
         # Stats tracking
         self.stats = {
@@ -73,10 +134,9 @@ Respond with just: MAIN_POST or COMMENT
             
             result = response.choices[0].message.content.strip().upper()
             
-            # Estimate cost (rough calculation for gpt-3.5-turbo)
-            input_tokens = len(prompt.split()) * 1.3  # Rough token estimation
-            output_tokens = 5
-            estimated_cost = (input_tokens * 0.0000015) + (output_tokens * 0.000002)  # Updated pricing
+            # Estimate cost (rough calculation)
+            tokens_used = len(prompt.split()) + 5
+            estimated_cost = tokens_used * 0.000001  # Rough estimate
             self.stats['estimated_cost'] += estimated_cost
             
             if self.stats['total_calls'] > 0:
@@ -142,3 +202,17 @@ Respond: NEW_POST or COMMENT
     def get_stats(self) -> Dict[str, Any]:
         """Get usage statistics"""
         return self.stats.copy()
+'''
+    
+    # Create src directory if it doesn't exist
+    src_dir = Path("src")
+    src_dir.mkdir(exist_ok=True)
+    
+    # Write the simple LLM classifier
+    with open("src/llm_classifier.py", 'w', encoding='utf-8') as f:
+        f.write(llm_content)
+    
+    print("Created simple LLM classifier (no proxies parameter)")
+
+if __name__ == "__main__":
+    find_llm_classifier_issue()

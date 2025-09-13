@@ -11,23 +11,44 @@ import os
 import subprocess
 import sys
 import time
+import importlib
 
 from datetime import datetime
 from loguru import logger
 from pathlib import Path
+from typing import List, Dict, Optional
+
+from playwright.async_api import async_playwright
 
 from src.llm_classifier import LLMClassifier
-from playwright.async_api import async_playwright
 from src.resources.fb_groups import fb_groups
-from sold_item_detector import SoldItemDetector
-from src.utils import setup_logging
-from typing import List, Dict, Optional
+from src.dom_ensemble import MLEnsemble, DOMExtractor
+from src.sold_item_detector import SoldItemDetector
+from src.ml_scraper import MLScraper, FeedbackLearning
+from src.training_manager import TrainingManager
+from src.utils import setup_enhanced_logging, get_module_logger, create_scraper_logger
+
+
+from dotenv import load_dotenv
+load_dotenv()
+
+print("🔥🔥🔥 SCRIPT STARTING - BULLETPROOF VERSION LOADED 🔥🔥🔥")
+print("🔥🔥🔥 THIS MESSAGE PROVES THE RIGHT FILE IS RUNNING 🔥🔥🔥")
+
+# Setup basic logging immediately - will be enhanced later with session-specific details
+setup_enhanced_logging(log_level="DEBUG")
+
+# Create module-level logger for functions outside the class
+logger = get_module_logger(__name__)
+logger.info("Enhanced logging initialized for fb_scraper.py module")
+
 
 class FacebookGroupScraper:
     def __init__(self, download_images=False, sale_posts_only=False, 
                 include_sold=True, sold_items_only=False, 
                 use_deep_sold_detection=False, visual_highlight=False,
                 use_llm_fallback=False, llm_confidence_threshold=70):
+        
         self.browser = None
         self.context = None
         self.page = None
@@ -56,23 +77,70 @@ class FacebookGroupScraper:
         # Create output directory
         self.output_dir.mkdir(exist_ok=True)
         
-        # SET UP LOGGING
+        # ENHANCED LOGGING SETUP WITH SESSION CONTEXT
         log_dir = self.output_dir / "logs"
         log_dir.mkdir(exist_ok=True)
         log_file = log_dir / f"scraper_{self.session_id}.log"
         
-        # Initialize logging with both console and file output
-        setup_logging(
-            log_level="INFO",
+        # Re-initialize logging with session-specific file
+        setup_enhanced_logging(
+            log_level="DEBUG",
             log_file=str(log_file)
         )
         
-        # Initialize LLM classifier if enabled
+        # Create session-specific logger with rich context
+        self.logger = create_scraper_logger(
+            session_id=self.session_id,
+            module_name=__name__,
+            scraper_type="FacebookGroupScraper",
+            output_dir=str(self.output_dir)
+        )
+
         if use_llm_fallback:
             try:
+                logger.info("DEBUG: About to create LLM classifier in FacebookGroupScraper")
+                
+                # Test 1: Check OpenAI version
+                import openai
+                logger.info(f"DEBUG: OpenAI version: {openai.__version__}")
+                
+                # Test 2: Try basic AsyncOpenAI creation
+                from openai import AsyncOpenAI
+                logger.info("DEBUG: Imported AsyncOpenAI successfully")
+                
+                # Test 3: Check environment variables
+                import os
+                api_key = os.getenv('OPENAI_API_KEY')
+                logger.info(f"DEBUG: API key exists: {bool(api_key)}")
+                
+                # Test 4: Try minimal client creation with 1.40.0 workaround
+                logger.info("DEBUG: Attempting minimal AsyncOpenAI creation...")
+                try:
+                    # OpenAI 1.40.0 specific fix - avoid any potential proxy issues
+                    test_client = AsyncOpenAI(
+                        api_key=api_key,
+                        max_retries=2,
+                        timeout=30.0
+                    )
+                    logger.info("DEBUG: Basic AsyncOpenAI creation successful!")
+                except Exception as e:
+                    logger.error(f"DEBUG: Basic AsyncOpenAI failed: {e}")
+                    # Try with even more minimal parameters
+                    try:
+                        import openai._client
+                        logger.info("DEBUG: Trying even more minimal creation...")
+                        test_client = AsyncOpenAI(api_key=api_key)
+                        logger.info("DEBUG: Minimal AsyncOpenAI creation successful!")
+                    except Exception as e2:
+                        logger.error(f"DEBUG: Even minimal AsyncOpenAI failed: {e2}")
+                        raise e2
+                
+                # Test 5: Now try the actual LLM classifier
                 from src.llm_classifier import LLMClassifier
+                logger.info("DEBUG: LLMClassifier imported successfully")
                 self.llm_classifier = LLMClassifier()
                 logger.info(f"LLM fallback enabled (threshold: {llm_confidence_threshold}%)")
+                
             except ImportError:
                 logger.error("LLMClassifier import failed - install required dependencies: pip install openai python-dotenv")
                 logger.warning("Continuing without LLM fallback")
@@ -139,7 +207,7 @@ class FacebookGroupScraper:
                         for page in pages:
                             if 'facebook.com' in page.url:
                                 self.page = page
-                                logger.success(f"Connected to existing Facebook tab: {page.url[:100]}")
+                                logger.info(f"✅ Connected to existing Facebook tab: {page.url[:100]}")
                                 return True
                         
                         # If no Facebook tab, use first tab
@@ -190,16 +258,16 @@ class FacebookGroupScraper:
                 try:
                     # Try with networkidle first (with shorter timeout)
                     await self.page.goto(target_url, wait_until='networkidle', timeout=15000)
-                    logger.success("Navigation completed with networkidle")
+                    logger.info("Navigation completed with networkidle")
                 except Exception as e:
                     logger.warning(f"Networkidle timeout, trying domcontentloaded: {str(e)[:50]}")
                     # Fallback to domcontentloaded
                     await self.page.goto(target_url, wait_until='domcontentloaded', timeout=10000)
                     await asyncio.sleep(5)  # Manual wait for content to load
-                    logger.success("Navigation completed with domcontentloaded fallback")
+                    logger.info("Navigation completed with domcontentloaded fallback")
                 
                 await asyncio.sleep(3)  # Extra wait for search results
-                logger.success(f"Successfully navigated to group {group_id}")
+                logger.info(f"Successfully navigated to group {group_id}")
             else:
                 logger.info(f"Already on appropriate page for group {group_id}")
             
@@ -395,7 +463,7 @@ class FacebookGroupScraper:
                     logger.debug(f"   Extracted: {extracted_preview}")
                     # Try re-extraction but don't fail if it doesn't match perfectly
             
-            logger.success(f"Extracted main post data for post {post_number}")
+            logger.info("✅ Extracted main post data for post {post_number}")
             
             # Process comments if present
             if comment_containers:
@@ -693,7 +761,7 @@ class FacebookGroupScraper:
                                     llm_result = await self.classify_with_llm_fallback(content_data['text_content'], content_data['html_size'])
                                     
                                     if llm_result['type'] == 'main_post' and llm_result['confidence'] >= 70:
-                                        logger.success(f"LLM override: Container {i+1} is a main post ({llm_result['confidence']}% confidence)")
+                                        logger.info(f"LLM override: Container {i+1} is a main post ({llm_result['confidence']}% confidence)")
                                         logger.info(f"LLM reasoning: {llm_result.get('reasoning', 'No reasoning provided')}")
                                         is_main_post_structural = True
                                     else:
@@ -721,7 +789,7 @@ class FacebookGroupScraper:
                             
                             if post_data and self.validate_main_post_data(post_data):
                                 posts.append(post_data)
-                                logger.success(f"✅ Successfully scraped post #{self.absolute_post_counter} -> Saved as post {len(posts)}/{num_posts}")
+                                logger.info(f"✅ Successfully scraped post #{self.absolute_post_counter} -> Saved as post {len(posts)}/{num_posts}")
                                 
                                 self.print_enhanced_post_summary(post_data, self.absolute_post_counter)
                                 self.posts_data = posts.copy()
@@ -813,7 +881,7 @@ class FacebookGroupScraper:
                 post_num
             )
             
-            logger.success(f"Extracted main post data for post {post_num}")
+            logger.info(f"Extracted main post data for post {post_num}")
             
             # Process comments if present
             if comment_containers:
@@ -900,7 +968,7 @@ class FacebookGroupScraper:
                 post_num  # Use the actual post number being processed
             )
             
-            logger.success(f"Extracted main post data for post {post_num}")
+            logger.info(f"Extracted main post data for post {post_num}")
             
             # Process comments if present
             if comment_containers:
@@ -987,7 +1055,7 @@ class FacebookGroupScraper:
                                 confidence = sold_analysis.get('confidence', 0)
                                 method = sold_analysis.get('sale_method', 'unknown')
                                 
-                                logger.success(f"✅ SOLD ITEM #{len(posts)} CONFIRMED: {confidence}% confidence via {method}")
+                                logger.info(f"✅ SOLD ITEM #{len(posts)} CONFIRMED: {confidence}% confidence via {method}")
                                 self.print_sold_item_debug(post_data)
                                 
                                 self.posts_data = posts.copy()
@@ -1016,7 +1084,7 @@ class FacebookGroupScraper:
                 continue
         
         self.posts_data = posts
-        logger.success(f"🏁 Sequential processing complete: {len(posts)} sold items found from {posts_processed} posts processed")
+        logger.info(f"🏁 Sequential processing complete: {len(posts)} sold items found from {posts_processed} posts processed")
         return posts
 
     async def scrape_sold_items_from_search(self, num_posts=10):
@@ -1083,7 +1151,7 @@ class FacebookGroupScraper:
                     # Add sold indicator since we know it's from the sold search
                     post_data['from_sold_search'] = True
                     posts.append(post_data)
-                    logger.success(f"Successfully scraped sold post {len(posts)}/{num_posts}")
+                    logger.info(f"Successfully scraped sold post {len(posts)}/{num_posts}")
                     self.print_post_debug_with_comments(post_data)
                     
                     # Update self.posts_data immediately
@@ -1180,11 +1248,11 @@ class FacebookGroupScraper:
                                 method = sold_analysis.get('sale_method', 'unknown')
                                 
                                 if sold_analysis.get('would_be_missed_by_search'):
-                                    logger.success(f"💎 HIDDEN SOLD ITEM #{len(sold_items_found)} FOUND! "
+                                    logger.info(f"💎 HIDDEN SOLD ITEM #{len(sold_items_found)} FOUND! "
                                                  f"(Post #{self.absolute_post_counter})")
                                     logger.info(f"   This sale would be MISSED by Facebook search!")
                                 else:
-                                    logger.success(f"✅ SOLD ITEM #{len(sold_items_found)} FOUND "
+                                    logger.info(f"✅ SOLD ITEM #{len(sold_items_found)} FOUND "
                                                  f"(Post #{self.absolute_post_counter})")
                                 
                                 self.print_enhanced_post_summary(post_data, self.absolute_post_counter)
@@ -1214,7 +1282,7 @@ class FacebookGroupScraper:
         
         logger.info(f"")
         logger.info(f"{'='*60}")
-        logger.success(f"🏁 Deep detection complete!")
+        logger.info(f"🏁 Deep detection complete!")
         logger.info(f"📊 Final Stats:")
         logger.info(f"   • Total posts scanned: {self.absolute_post_counter}")
         logger.info(f"   • Sold items found: {len(sold_items_found)}/{num_posts}")
@@ -1370,7 +1438,7 @@ class FacebookGroupScraper:
                         )
                         
                         if verification['is_new_post'] and verification['confidence'] >= 70:
-                            logger.success(f"LLM boundary override: Found main post at container {potential_index + 1} (confidence: {verification['confidence']}%)")
+                            logger.info(f"LLM boundary override: Found main post at container {potential_index + 1} (confidence: {verification['confidence']}%)")
                             return potential_index
                             
                 except Exception as e:
@@ -2138,7 +2206,7 @@ class FacebookGroupScraper:
                                 if not any(ui_indicator in elem_text for ui_indicator in [
                                     'AuthorVery responsive', 'LikeReply', 'Still available', 'Follow'
                                 ]):
-                                    logger.success(f"Found alternative content: '{elem_text[:50]}...' ({len(elem_text)} chars)")
+                                    logger.info(f"✅ Found alternative content: '{elem_text[:50]}...' ({len(elem_text)} chars)")
                                     return {
                                         'html_content': standard_content['html_content'],
                                         'text_content': elem_text,
@@ -2176,7 +2244,7 @@ class FacebookGroupScraper:
                 ''')
                 
                 if alternative_text and len(alternative_text) > len(text) and 'flagg' in alternative_text.lower():
-                    logger.success(f"JavaScript extraction found USS Flagg content: '{alternative_text[:50]}...'")
+                    logger.info(f"JavaScript extraction found USS Flagg content: '{alternative_text[:50]}...'")
                     return {
                         'html_content': standard_content['html_content'],
                         'text_content': alternative_text,
@@ -2358,7 +2426,7 @@ class FacebookGroupScraper:
             current_url = self.page.url
             
             if 'filter=sell' in current_url:
-                logger.success("Facebook sale filter appears to be active in URL")
+                logger.info("Facebook sale filter appears to be active in URL")
                 
                 # Additional check: look for reduced post count or sale-specific UI
                 await asyncio.sleep(2)
@@ -2774,7 +2842,7 @@ class FacebookGroupScraper:
                 indicators = sold_analysis['sold_indicators']
                 method = sold_analysis['sale_method']
                 
-                logger.success(f"SOLD ITEM DETECTED: Post {post_number}")
+                logger.info(f"SOLD ITEM DETECTED: Post {post_number}")
                 logger.info(f"  Confidence: {confidence}%")
                 logger.info(f"  Method: {method}")
                 logger.debug(f"  Indicators: {indicators[:3]}")
@@ -3964,7 +4032,7 @@ class FacebookGroupScraper:
             )
             
             if all_same:
-                logger.success("✅ EXTRACTION CONSISTENT: All 3 extractions returned identical content")
+                logger.info("✅ EXTRACTION CONSISTENT: All 3 extractions returned identical content")
             else:
                 logger.warning("⚠️ EXTRACTION INCONSISTENT: Content varied between extractions")
                 logger.info("This suggests Facebook is dynamically updating container content")
@@ -4251,7 +4319,7 @@ class FacebookGroupScraper:
             checkpoint_file = self.output_dir / f"checkpoint_{self.session_id}.json"
             with open(checkpoint_file, 'w', encoding='utf-8') as f:
                 json.dump(data_to_save, f, indent=2, ensure_ascii=False)
-            logger.success(f"Auto-saved {len(data_to_save)} posts to checkpoint")
+            logger.info(f"Auto-saved {len(data_to_save)} posts to checkpoint")
             
         except Exception as e:
             logger.error(f"Auto-save failed: {str(e)[:50]}")
@@ -4273,7 +4341,7 @@ class FacebookGroupScraper:
             try:
                 with open(json_file, 'w', encoding='utf-8') as f:
                     json.dump(self.posts_data, f, indent=2, ensure_ascii=False)
-                logger.success(f"Full data saved to: {json_file}")
+                logger.info(f"Full data saved to: {json_file}")
             except Exception as e:
                 logger.error(f"Failed to save JSON: {str(e)}")
             
@@ -4320,7 +4388,7 @@ class FacebookGroupScraper:
                         writer.writeheader()
                         writer.writerows(sales_data)
                         
-                logger.success(f"Sales summary saved to: {sales_csv}")
+                logger.info(f"Sales summary saved to: {sales_csv}")
                 
             except Exception as e:
                 logger.error(f"Failed to save CSV: {str(e)}")
@@ -4334,7 +4402,7 @@ class FacebookGroupScraper:
                             f.write(f"Text: {post.get('text', '')[:200]}\n")
                             f.write(f"Images: {post.get('image_count', 0)}\n")
                             f.write("-" * 50 + "\n")
-                    logger.success(f"Created text backup: {backup_file}")
+                    logger.info(f"Created text backup: {backup_file}")
                 except:
                     logger.error("Even backup save failed")
             
@@ -4353,7 +4421,7 @@ class FacebookGroupScraper:
                     f.write(f"Posts scraped: {len(self.posts_data)}\n\n")
                     for i, post in enumerate(self.posts_data):
                         f.write(f"Post {i+1}: {str(post)}\n\n")
-                logger.success(f"Emergency save completed: {emergency_file}")
+                logger.info(f"Emergency save completed: {emergency_file}")
             except:
                 logger.error("Emergency save also failed")
 
@@ -4435,7 +4503,7 @@ class FacebookGroupScraper:
         try:
             if hasattr(self, 'playwright') and self.playwright:
                 await self.playwright.stop()
-                logger.success("Playwright closed successfully")
+                logger.info("Playwright closed successfully")
         except Exception as e:
             logger.error(f"Error closing playwright: {str(e)}")
         
@@ -4445,9 +4513,8 @@ class FacebookGroupScraper:
 
 
 def start_browser_with_debugging():
-    """Helper to start browser with remote debugging"""
-    print("\n🚀 Starting Browser with Remote Debugging...")
-    print("-" * 60)
+    """Helper to start browser with remote debugging - now with enhanced logging"""
+    logger.info("Starting browser with remote debugging...")
     
     # Check for Chrome and Edge paths
     chrome_paths = [
@@ -4468,6 +4535,7 @@ def start_browser_with_debugging():
         if os.path.exists(path):
             browser_path = path
             browser_name = "Chrome"
+            logger.info(f"Found {browser_name} at: {path}")
             break
     
     if not browser_path:
@@ -4475,11 +4543,11 @@ def start_browser_with_debugging():
             if os.path.exists(path):
                 browser_path = path
                 browser_name = "Edge"
+                logger.info(f"Found {browser_name} at: {path}")
                 break
     
     if browser_path:
-        print(f"✅ Found {browser_name} at: {browser_path}")
-        print(f"\n🔌 Starting {browser_name} with remote debugging...")
+        logger.info(f"Starting {browser_name} with remote debugging...")
         
         # Start browser with debugging
         subprocess.Popen([
@@ -4488,6 +4556,7 @@ def start_browser_with_debugging():
             "--user-data-dir=C:\\temp\\chrome_debug"  # Temporary profile
         ])
         
+        logger.info(f"{browser_name} started successfully!")
         print(f"\n✅ {browser_name} started!")
         print("\n📋 Next steps:")
         print("1. Log into Facebook in the browser that just opened")
@@ -4497,24 +4566,29 @@ def start_browser_with_debugging():
         input("\nPress Enter when ready...")
         return True
     else:
+        logger.error("Could not find Chrome or Edge")
         print("❌ Could not find Chrome or Edge")
         return False
 
 def prompt_select_groups(groups):
     """
     Show a numbered list of group names and return a list of selected group dicts.
-    Accepts: single number (e.g., '2'), comma-separated (e.g., '1,3'), or 'a' for all.
+    Enhanced with logging.
     """
     if not groups:
+        logger.error("No Facebook groups configured in resources/fb_groups.py")
         print("No Facebook groups configured in resources/fb_groups.py")
         return []
 
+    logger.info(f"Presenting {len(groups)} available Facebook groups to user")
     print("\n📋 Available Facebook Groups:")
     for i, g in enumerate(groups, start=1):
         print(f"  {i}. {g['group_name']}  ({g['group_id']})")
 
     raw = input("\nChoose group(s) [number, numbers comma-separated, or 'a' for all]: ").strip().lower()
+    
     if raw == "a":
+        logger.info("User selected all groups")
         return groups
 
     # parse indices
@@ -4524,33 +4598,233 @@ def prompt_select_groups(groups):
         for idx in idxs:
             if 1 <= idx <= len(groups):
                 selected.append(groups[idx - 1])
+                logger.info(f"User selected group: {groups[idx - 1]['group_name']}")
             else:
+                logger.warning(f"User provided out-of-range index: {idx}")
                 print(f"  ⚠️ Skipping out-of-range index: {idx}")
+        
+        logger.info(f"Final selection: {len(selected)} groups")
         return selected
     except ValueError:
+        logger.warning("User provided invalid input, using first group as default")
         print("  ⚠️ Invalid input. Using the first group as default.")
         return [groups[0]]
 
+# Helper function for training DOM models
+async def train_dom_models_from_collected_data(enhanced_scraper):
+    """Train DOM ML models using collected training data with heuristic labels"""
+    print("🤖 Training DOM ML models with collected data...")
+    
+    # Use high-confidence structural predictions as training labels
+    high_confidence_examples = []
+    
+    for example in enhanced_scraper.training_data_collected:
+        if 'all_predictions' in example and example['all_predictions'].get('structural'):
+            structural = example['all_predictions']['structural']
+        else:
+            # Fallback to old format
+            structural = example.get('structural_prediction', {})
+        
+        # Use high confidence structural predictions as ground truth
+        if structural and structural.get('confidence', 0) >= 85:
+            is_main_post = structural['type'] == 'main_post'
+            
+            high_confidence_examples.append({
+                'html_content': example['html_content'],
+                'text_content': example['text_content'],
+                'position_data': example['position_data'],
+                'is_main_post': is_main_post
+            })
+    
+    if len(high_confidence_examples) >= 10:
+        print(f"📚 Training on {len(high_confidence_examples)} high-confidence examples")
+        
+        try:
+            metrics = enhanced_scraper.add_manual_labels_and_retrain(high_confidence_examples)
+            if metrics:
+                print("🎉 DOM ML model training completed!")
+                print(f"   Test accuracy: {metrics['ensemble_test_score']:.3f}")
+                print("✅ DOM ML layer is now active for future runs!")
+                
+                # Show top features learned
+                if 'feature_importance' in metrics and metrics['feature_importance']:
+                    print("\n🧠 Top features the model learned:")
+                    for i, (feature, importance) in enumerate(list(metrics['feature_importance'].items())[:5]):
+                        clean_name = feature.replace('_', ' ').title()
+                        print(f"   {i+1}. {clean_name}: {importance:.3f}")
+                
+            else:
+                print("❌ Training failed - check logs for details")
+        except Exception as e:
+            print(f"❌ Training error: {e}")
+    else:
+        print(f"❌ Need at least 10 high-confidence examples, got {len(high_confidence_examples)}")
+        print("💡 Scrape more posts to collect additional training data")
 
+# Helper function for applying feedback (can be called separately)
+async def apply_feedback_to_models(feedback_json_path: str, scraper_output_dir: Path):
+    """Apply feedback to retrain models - can be called after scraping"""
+    
+    print(f"🔄 Applying feedback from: {feedback_json_path}")
+    
+    from src.ml_scraper import MLScraper
+    from src.training_manager import FeedbackLearning
+    
+    # Create temporary scraper for model access
+    temp_scraper = FacebookGroupScraper()
+    temp_scraper.output_dir = scraper_output_dir
+    
+    ml_scraper = MLScraper(
+        original_scraper=temp_scraper,
+        enable_ml=True,
+        enable_llm=False,
+        model_dir=Path("models/dom_ensemble")
+    )
+    
+    feedback_system = FeedbackLearning(scraper_output_dir)
+    
+    success = feedback_system.apply_feedback_to_models(feedback_json_path, ml_scraper)
+    
+    if success:
+        print("🎉 Feedback successfully applied! Models improved for future runs.")
+    else:
+        print("❌ Feedback application failed - check the logs")
+    
+    return success
+
+def apply_feedback_from_file(feedback_json_path: str, scraper_output_dir: str) -> bool:
+    """
+    Enhanced helper function to apply feedback from a downloaded JSON file.
+    
+    Args:
+        feedback_json_path: Path to the downloaded feedback JSON file
+        scraper_output_dir: Path to the scraper output directory
+    
+    Returns:
+        True if feedback was successfully applied and models improved
+    """
+    print(f"\n🔄 APPLYING FEEDBACK FROM FILE")
+    print("="*50)
+    print(f"📄 Feedback file: {feedback_json_path}")
+    print(f"📁 Scraper output: {scraper_output_dir}")
+    
+    try:
+        from pathlib import Path
+        import json
+        from src.training_manager import FeedbackLearning
+        from src.ml_scraper import MLScraper
+        
+        # Validate files exist
+        feedback_path = Path(feedback_json_path)
+        output_path = Path(scraper_output_dir)
+        
+        if not feedback_path.exists():
+            print(f"❌ Feedback file not found: {feedback_json_path}")
+            return False
+            
+        if not output_path.exists():
+            print(f"❌ Scraper output directory not found: {scraper_output_dir}")
+            return False
+        
+        # Load feedback to get session ID
+        with open(feedback_path, 'r') as f:
+            feedback_data = json.load(f)
+            
+        session_id = feedback_data.get('session_id', 'unknown')
+        feedback_count = len(feedback_data.get('feedback', {}))
+        
+        print(f"📋 Session ID: {session_id}")
+        print(f"📊 Feedback entries: {feedback_count}")
+        
+        if feedback_count == 0:
+            print("⚠️ No feedback provided - nothing to apply")
+            return False
+        
+        # Create a temporary enhanced scraper for model access
+        print("🔧 Setting up model retraining environment...")
+        
+        # Create minimal scraper interface for MLScraper
+        class TempScraper:
+            def __init__(self, session_id, output_dir):
+                self.session_id = session_id
+                self.output_dir = output_dir
+                
+            def _classify_by_structural_patterns(self, text):
+                return {'type': 'main_post', 'confidence': 50}
+        
+        temp_scraper = TempScraper(session_id, output_path)
+        
+        # Create MLScraper with model access
+        enhanced_scraper = MLScraper(
+            original_scraper=temp_scraper,
+            enable_ml=True,
+            enable_llm=False,
+            training_mode=False,
+            model_dir=Path("models/dom_ensemble")
+        )
+        
+        print("✅ Model environment ready")
+        
+        # Create feedback system
+        try:
+            feedback_system = FeedbackLearning(
+                scraper_output_dir=output_path,
+                session_id=session_id
+            )
+        except TypeError:
+            feedback_system = FeedbackLearning(
+                scraper_output_dir=output_path
+            )
+        
+        # Apply the feedback
+        print("🤖 Retraining DOM ML models with your corrections...")
+        print("   This may take 30-60 seconds...")
+        
+        success = feedback_system.apply_feedback_to_models(
+            str(feedback_path), 
+            enhanced_scraper
+        )
+        
+        if success:
+            print("\n🎉 FEEDBACK SUCCESSFULLY APPLIED!")
+            print("✅ DOM ML models have been retrained with your corrections")
+            print("💡 Future scraping sessions will be more accurate")
+            print("📈 The system learned from your feedback")
+            return True
+        else:
+            print("\n❌ FEEDBACK APPLICATION FAILED")
+            print("💡 Check the log files for detailed error information")
+            print("🔧 Common issues: Invalid feedback format, missing prediction data")
+            return False
+            
+    except Exception as e:
+        print(f"\n❌ ERROR APPLYING FEEDBACK: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+    
 async def main():
-    """Main function with LLM integration options"""
+    """Main function with 3-layer ML enhancement and feedback learning - BULLETPROOF DEBUG VERSION"""
+    print("=== MAIN FUNCTION ENTRY DEBUG - Enhanced Scraper Test ===")
+    
+
+    print("DEBUG: Modules force-reloaded")
+    
     print("\n" + "=" * 60)
     print("Facebook Group Scraper - GI Joe & Collectibles")
-    print("Uses existing browser session - no login required!")
+    print("3-Layer AI Enhanced: Structural → DOM ML → LLM → Feedback Learning")
     print("=" * 60)    
     
-    print("\nOptions:")
+    print("\nBrowser Connection:")
     print("1. Use existing browser (you're already logged in) [DEFAULT]")
     print("2. Start new browser with debugging (I'll help you set it up)")
     
     choice = input("\nChoice (1-2, default=1): ").strip()
     
-    # DEFAULT TO OPTION 1 (Use existing browser)
     if choice == '2':
         if not start_browser_with_debugging():
             return
     else:
-        # Default behavior - use existing browser
         if choice and choice != '1':
             print("Invalid choice, using default option 1 (existing browser)")
         print("\nMake sure you have a browser open with remote debugging:")
@@ -4598,7 +4872,6 @@ async def main():
         use_deep_sold_detection = True
         print("Will use DEEP SOLD DETECTION (analyzes posts + comments)")
         print("This finds sales confirmed in comments that Facebook search might miss")
-        print("Perfect for comprehensive market research")
         
     else:
         sale_posts_only = False
@@ -4613,239 +4886,442 @@ async def main():
     visual_highlight = highlight != 'n'
     
     if visual_highlight:
-        print("Visual highlighting enabled - watch the browser to see posts being processed!")
-        print("Each post will be highlighted with a red border and yellow background")
+        print("Visual highlighting enabled")
     else:
-        print("Visual highlighting disabled (better performance)")
+        print("Visual highlighting disabled")
     
-    # NEW: AI Enhancement Options
-    print("\nAI Enhancement Options:")
+    # 3-Layer AI Enhancement Setup
+    print("\n" + "="*50)
+    print("3-LAYER AI ENHANCEMENT SETUP")
+    print("="*50)
+    
+    # Check existing models
+    from pathlib import Path
+    model_dir = Path("models/dom_ensemble")
+    has_dom_models = (model_dir / "ensemble_model.pkl").exists()
+    
+    # Layer 1: Structural (always enabled)
+    print("Layer 1: Structural Detection ✅ (your existing rules)")
+    
+    # Layer 2: DOM ML Setup
+    print("\nLayer 2: DOM Machine Learning")
+    if has_dom_models:
+        print("✅ Found existing DOM ML models!")
+        enable_dom_ml = input("Enable DOM ML layer? (y/n, default=y): ").strip().lower() != 'n'
+    else:
+        print("❌ No existing DOM ML models found")
+        print("1. Train DOM ML models now (collect training data)")
+        print("2. Skip DOM ML layer")
+        
+        dom_choice = input("Choice (1-2, default=1): ").strip()
+        if dom_choice == '2':
+            enable_dom_ml = False
+            print("DOM ML layer disabled")
+        else:
+            enable_dom_ml = True  # Will train during scraping
+            print("DOM ML training enabled - will collect training data")
+    
+    # Layer 3: LLM Setup  
+    print("\nLayer 3: LLM Enhancement (OpenAI API)")
+    enable_llm = False  # Temporary - bypass OpenAI issue
+    print("DEBUG: LLM temporarily disabled to test enhanced scraper")
 
-    use_llm = input("Enable LLM fallback for uncertain cases? (y/n, default=y): ").strip().lower()
-    use_llm_fallback = use_llm != 'n'  # Default to True unless explicitly 'n'
-
-    llm_threshold = 40  # New default
-    if use_llm_fallback:
+    llm_threshold = 70
+    if enable_llm:
         threshold_input = input("LLM confidence threshold (50-90, default=70): ").strip()
         try:
             llm_threshold = int(threshold_input) if threshold_input else 70
-            llm_threshold = max(30, min(90, llm_threshold))  # Clamp between 50-90
+            llm_threshold = max(50, min(90, llm_threshold))
         except ValueError:
             llm_threshold = 70
         
-        print(f"LLM fallback enabled (threshold: {llm_threshold}%)")
-        print("This will use AI to classify uncertain posts, improving accuracy")
-        print("Estimated cost: $0.001-0.01 per scraping session")
-        print("Make sure you have set your OPENAI_API_KEY in .env file")
+        print(f"LLM layer enabled (threshold: {llm_threshold}%)")
+        print("Cost: ~$0.001-0.005 per session (only used for uncertain cases)")
+        print("Make sure OPENAI_API_KEY is set in your .env file")
     else:
-        print("Using structural detection only")
+        print("LLM layer disabled")
     
-    # Ask about downloading images
+    # Training and Feedback Options - UPDATED DEFAULTS
+    print("\nTraining & Feedback Options:")
+    if has_dom_models and enable_dom_ml:
+        training_mode = False
+        collect_training = input("Also collect training data for model improvement? (y/n, default=y): ").strip().lower()
+        training_mode = collect_training != 'n'  # Default to yes unless explicitly 'n'
+        
+        feedback_mode = input("Enable feedback learning after scraping? (y/n, default=y): ").strip().lower() != 'n'  # Default to yes
+        
+        if training_mode:
+            print("✅ Training data collection enabled")
+        if feedback_mode:
+            print("✅ Feedback learning enabled - you can review results and improve accuracy")
+    else:
+        training_mode = not has_dom_models  # Auto-enable training if no models
+        feedback_mode = True  # Always enable feedback
+        if training_mode:
+            print("✅ Training data collection auto-enabled (building first models)")
+        if feedback_mode:
+            print("✅ Feedback learning enabled - you can review results and improve accuracy")
+    
+    # Other options
     download = input("\nDownload images? (y/n, default=y): ").strip().lower()
     download_images = download != 'n'
     
-    if download_images:
-        print("Will download images to local folder")
-    else:
-        print("Will only save image URLs (not downloading)")
-    
-    # Ask about autonomous operation
-    autonomous = input("\nRun autonomously without user prompts? (y/n, default=y): ").strip().lower()
+    autonomous = input("Run autonomously without user prompts? (y/n, default=y): ").strip().lower()
     autonomous_mode = autonomous != 'n'
     
-    if autonomous_mode:
-        print("Autonomous mode enabled - will run without user interaction")
-    else:
-        print("Interactive mode - will ask for confirmation if needed")
-    
-    # Create scraper with all options including LLM
+    # Create original scraper
     scraper = FacebookGroupScraper(
         download_images=download_images,
         sale_posts_only=sale_posts_only,
         include_sold=include_sold,
         sold_items_only=sold_items_only,
-        use_deep_sold_detection=use_deep_sold_detection if 'use_deep_sold_detection' in locals() else False,
+        use_deep_sold_detection=use_deep_sold_detection,
         visual_highlight=visual_highlight,
-        use_llm_fallback=use_llm_fallback,
+        use_llm_fallback=enable_llm,  # This should now be False
         llm_confidence_threshold=llm_threshold
     )
     
+    print(f"DEBUG: Created scraper type: {type(scraper)}")
+    print(f"DEBUG: Available methods: {[m for m in dir(scraper) if 'scrape' in m]}")
+    
     try:
-        # Connect to browser
         if await scraper.connect_to_existing_browser():
-            
-            # Ask which group(s) to scrape using the configured list
+            print("DEBUG: Browser connected successfully - about to proceed to enhanced scraper setup")
+
+            # Group selection
             selected_groups = prompt_select_groups(fb_groups)
             if not selected_groups:
                 print("No groups selected. Exiting.")
                 return
 
-            # Navigate to each selected group
             for grp in selected_groups:
                 group_id = grp["group_id"]
                 print(f"\nSelected group: {grp['group_name']} ({group_id})")
                 await scraper.navigate_to_group(group_id)
             
-            # How many posts?
             num = input("\nNumber of posts to scrape (default 10): ").strip()
             num_posts = int(num) if num else 10
             
-            # Adjust expectations based on filtering mode
+            # BULLETPROOF DEBUG: Force print statements that will definitely appear
+            print("=" * 80)
+            print("🔥 BULLETPROOF DEBUG: ABOUT TO CREATE ENHANCED SCRAPER")
+            print("=" * 80)
+            
+            # CRITICAL FIX: Always create enhanced scraper for 3-layer processing
+            print(f"\n🚀 Setting up 3-layer AI enhancement...")
+            
+            from src.ml_scraper import MLScraper
+            from src.training_manager import FeedbackLearning
+            
+            try:
+                enhanced_scraper = MLScraper(
+                    original_scraper=scraper,
+                    enable_ml=enable_dom_ml,
+                    enable_llm=enable_llm,
+                    training_mode=training_mode,
+                    model_dir=model_dir
+                )
+                print("🔥 ENHANCED SCRAPER CREATED SUCCESSFULLY!")
+            except Exception as e:
+                print(f"🔥 ENHANCED SCRAPER CREATION FAILED: {e}")
+                import traceback
+                traceback.print_exc()
+                return
+
+            # BULLETPROOF DEBUG: Use print() instead of logger to ensure visibility
+            print("🔥 BULLETPROOF DEBUG: Enhanced scraper created!")
+            print(f"🔥 Type: {type(enhanced_scraper)}")
+            print(f"🔥 Has enhanced_scraping_with_three_layers: {hasattr(enhanced_scraper, 'enhanced_scraping_with_three_layers')}")
+            print(f"🔥 Available methods: {[m for m in dir(enhanced_scraper) if 'scraping' in m.lower() or 'layer' in m.lower()]}")
+
+            # BULLETPROOF DEBUG: Debug the routing logic variables
+            print(f"\n🔥 ROUTING DEBUG:")
+            print(f"🔥 use_deep_sold_detection: {use_deep_sold_detection}")
+            print(f"🔥 sold_items_only: {sold_items_only}")
+            print(f"🔥 Will use enhanced scraper: {not (use_deep_sold_detection or sold_items_only)}")
+            
+            # Show system status with bulletproof output
+            print("\n🔥 AI SYSTEM STATUS:")
+            print(f"🔥 Layer 1 (Structural): ✅ Active")
+            print(f"🔥 Layer 2 (DOM ML): {'✅ Active' if enable_dom_ml else '⏸️ Disabled'}")
+            print(f"🔥 Layer 3 (LLM): {'✅ Active' if enable_llm else '⏸️ Disabled'}")
+            print(f"🔥 Training mode: {training_mode}")
+            print(f"🔥 Autonomous mode: {autonomous_mode}")
+            
+            # Show expectations
             if sold_items_only:
-                print(f"\nSOLD ITEMS MODE: Scanning for {num_posts} completed sales")
-                print("This is perfect for market research - see what actually sells!")
-                print("Will analyze both posts and comments for sale completion evidence")
+                print(f"\n🔥 MODE: SOLD ITEMS - Scanning for {num_posts} completed sales")
+            elif use_deep_sold_detection:
+                print(f"\n🔥 MODE: DEEP SOLD DETECTION - Finding sales confirmed in comments")
             elif sale_posts_only:
-                print(f"\nSALE FILTERING: May need to scan more posts to find {num_posts} sale posts")
+                print(f"\n🔥 MODE: SALE FILTERING - Looking for {num_posts} sale posts")
+            else:
+                print(f"\n🔥 MODE: ENHANCED 3-LAYER - Scraping {num_posts} posts with AI enhancement")
             
-            print("\nDon't click anything in the browser while scraping!")
-            print("The script will handle everything automatically.")
+            print(f"\n🔥 Don't interact with the browser during scraping!")
             
-            if autonomous_mode:
-                print("Running in autonomous mode - no user interaction required.")
-            if use_llm_fallback:
-                print("LLM-enhanced detection active - improved accuracy for edge cases.")
-            print("Enhanced version with sold items detection.\n")
-            
-            # Calculate timeout based on mode
+            # Calculate timeout
+            base_timeout = max(240, num_posts * 25)
             if use_deep_sold_detection:
                 base_timeout = max(500, num_posts * 50)
             elif sold_items_only:
                 base_timeout = max(300, num_posts * 30)
-            elif sale_posts_only:
-                base_timeout = max(300, num_posts * 30)
-            else:
-                base_timeout = max(240, num_posts * 25)
-                        
-            # Scraping with appropriate method
+            
+            # Add extra time for enhanced processing
+            base_timeout = int(base_timeout * 1.3)
+            
+            # BULLETPROOF DEBUG: Main scraping logic
+            print("🔥" * 80)
+            print("🔥 STARTING MAIN SCRAPING LOOP")
+            print("🔥" * 80)
+            
             all_posts = []
             attempt = 1
-            max_retries = 3 if (sold_items_only or use_deep_sold_detection) else 2
+            max_retries = 2
             remaining_posts = num_posts
             
             while len(all_posts) < num_posts and attempt <= max_retries:
+                print(f"\n🔥 ATTEMPT {attempt}/{max_retries} - CURRENT POSTS: {len(all_posts)}/{num_posts}")
+                
                 try:
+                    # BULLETPROOF DEBUG: Show exactly which path we're taking
+                    print(f"🔥 ROUTING DECISION:")
+                    print(f"🔥   use_deep_sold_detection = {use_deep_sold_detection}")
+                    print(f"🔥   sold_items_only = {sold_items_only}")
+                    print(f"🔥   Enhanced path condition = {not (use_deep_sold_detection or sold_items_only)}")
+                    
                     if use_deep_sold_detection:
-                        print(f"Attempt {attempt}/{max_retries}: Deep-scanning for {remaining_posts} sold items (timeout: {base_timeout}s)")
+                        print(f"🔥 TAKING PATH: Deep sold detection")
                         posts = await asyncio.wait_for(
                             scraper.scrape_with_deep_sold_detection(remaining_posts),
                             timeout=base_timeout
                         )
+                        
                     elif sold_items_only:
-                        print(f"Attempt {attempt}/{max_retries}: Scraping {remaining_posts} posts from Facebook search (timeout: {base_timeout}s)")
+                        print(f"🔥 TAKING PATH: Facebook search sold items")
                         posts = await asyncio.wait_for(
                             scraper.scrape_sold_items_from_search(remaining_posts),
                             timeout=base_timeout
                         )
+                        
                     else:
-                        print(f"Attempt {attempt}/{max_retries}: Scraping {remaining_posts} posts (timeout: {base_timeout}s)")
+                        print(f"🔥 TAKING PATH: Enhanced 3-layer scraper")
+                        print(f"🔥 CALLING: enhanced_scraper.enhanced_scraping_with_three_layers({remaining_posts})")
+                        
+                        # BULLETPROOF DEBUG: Verify method exists
+                        if hasattr(enhanced_scraper, 'enhanced_scraping_with_three_layers'):
+                            print(f"🔥 Method verified - calling enhanced scraper now!")
+                        else:
+                            print(f"🔥 CRITICAL ERROR: Method missing!")
+                            for method in dir(enhanced_scraper):
+                                if not method.startswith('_'):
+                                    print(f"🔥   Available: {method}")
+                            return
+                        
+                        # BULLETPROOF: Force console output before the call
+                        import sys
+                        sys.stdout.flush()
+                        
+                        # Call the enhanced scraper
                         posts = await asyncio.wait_for(
-                            scraper.scrape_with_thread_boundary_detection(remaining_posts),
+                            enhanced_scraper.enhanced_scraping_with_three_layers(remaining_posts),
                             timeout=base_timeout
                         )
-                    
+                        
+                        print(f"🔥 ENHANCED SCRAPER RETURNED: {len(posts) if posts else 0} posts")
+                                        
                     if posts:
                         all_posts.extend(posts)
-                        if use_deep_sold_detection:
-                            print(f"Found {len(posts)} sold items via deep detection in attempt {attempt}")
-                            comment_sales = sum(1 for p in posts 
-                                            if p.get('sold_analysis', {}).get('sale_method') in ['comments', 'both'])
-                            if comment_sales > 0:
-                                print(f"   {comment_sales} were confirmed via comments (Facebook search would miss these!)")
-                        elif sold_items_only:
-                            print(f"Got {len(posts)} sold posts from Facebook search in attempt {attempt}")
-                        else:
-                            print(f"Got {len(posts)} posts in attempt {attempt}")
+                        print(f"🔥 SUCCESS! Total posts now: {len(all_posts)}")
+                        
+                        # Show AI layer usage stats only for enhanced scraper
+                        if not (use_deep_sold_detection or sold_items_only):
+                            try:
+                                stats = enhanced_scraper.detection_stats
+                                total = stats.get('total_classifications', 0)
+                                if total > 0:
+                                    print(f"🔥 AI LAYER USAGE STATS:")
+                                    print(f"🔥   Total classifications: {total}")
+                                    print(f"🔥   DOM ML used: {stats.get('dom_ml_used', 0)}")
+                                    print(f"🔥   LLM used: {stats.get('llm_used', 0)}")
+                                else:
+                                    print(f"🔥 NO AI STATS AVAILABLE (total_classifications = 0)")
+                            except Exception as e:
+                                print(f"🔥 ERROR GETTING AI STATS: {e}")
+                        
                         break
+                    else:
+                        print(f"🔥 NO POSTS RETURNED - posts = {posts}")
                     
                 except asyncio.TimeoutError:
-                    print(f"\nTimeout on attempt {attempt}, retrieving partial results...")
-                    partial_posts = scraper.posts_data or []
-                    if partial_posts:
-                        all_posts.extend(partial_posts)
-                        print(f"Retrieved {len(partial_posts)} posts from attempt {attempt}")
-                    
-                    if autonomous_mode and len(all_posts) < num_posts and attempt < max_retries:
-                        remaining_posts = num_posts - len(all_posts)
-                        print(f"Autonomous retry: Attempting {remaining_posts} more posts...")
-                        attempt += 1
-                        base_timeout = max(300, remaining_posts * 40)
-                        continue
-                    else:
-                        break
+                    print(f"🔥 TIMEOUT on attempt {attempt}")
+                    break
                 
                 except Exception as e:
-                    print(f"Error on attempt {attempt}: {str(e)[:100]}")
-                    if hasattr(scraper, 'posts_data') and scraper.posts_data:
-                        partial_posts = scraper.posts_data or []
-                        all_posts.extend(partial_posts)
-                        print(f"Retrieved {len(partial_posts)} posts before error")
-                    
-                    if autonomous_mode and attempt < max_retries:
-                        print(f"Autonomous retry after error...")
-                        attempt += 1
-                        continue
-                    else:
-                        break
+                    print(f"🔥 ERROR on attempt {attempt}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    break
             
-            # Results handling
+            # Results processing
             posts = all_posts
+            print(f"🔥 FINAL RESULT: {len(posts)} posts scraped")
             
             if posts and len(posts) > 0:
-                scraper.posts_data = posts
-                
-                try:
+                # CRITICAL FIX: Ensure the correct scraper saves the data
+                if use_deep_sold_detection or sold_items_only:
+                    scraper.posts_data = posts
                     await scraper.save_results_fixed()
-                    
-                    if sold_items_only:
-                        print(f"\nSuccessfully found {len(posts)} sold items!")
-                        print("Perfect for market research:")
-                        print("   - See what items actually sell")
-                        print("   - Understand pricing trends")
-                        print("   - Identify popular items")
-                        
-                        high_confidence = sum(1 for p in posts if p.get('sold_analysis', {}).get('confidence', 0) >= 80)
-                        comment_sales = sum(1 for p in posts if p.get('sold_analysis', {}).get('sale_method') in ['comments', 'both'])
-                        
-                        print(f"   - {high_confidence} high-confidence sales (≥80%)")
-                        print(f"   - {comment_sales} sales completed in comments")
-                        
-                    elif sale_posts_only:
-                        print(f"\nSuccessfully found {len(posts)} sale posts!")
-                    else:
-                        print(f"\nSuccessfully scraped {len(posts)} posts!")
-                        
-                    print(f"Data saved in folder: {scraper.output_dir}/")
-                    
-                except Exception as e:
-                    print(f"Error during save: {str(e)[:100]}")
-            else:
-                if sold_items_only:
-                    print(f"\nNo sold items found after {attempt-1} attempts")
-                    print("This could mean:")
-                    print("1. No recent sales in this group")
-                    print("2. Sales aren't clearly marked as sold")
-                    print("3. Try a larger group or different time period")
+                    output_dir = scraper.output_dir
+                    session_id = scraper.session_id
+                    print(f"🔥 SAVED via original scraper to: {output_dir}")
                 else:
-                    print(f"\nNo posts found after {attempt-1} attempts")
+                    # FIX: Use enhanced_scraper.scraper for saving
+                    enhanced_scraper.scraper.posts_data = posts
+                    await enhanced_scraper.scraper.save_results_fixed()
+                    output_dir = enhanced_scraper.scraper.output_dir
+                    session_id = enhanced_scraper.scraper.session_id
+                    print(f"🔥 SAVED via enhanced scraper to: {output_dir}")
+                
+                print(f"\n🎉 SUCCESS! Scraped {len(posts)} posts")
+                print(f"   Data saved to: {output_dir}/")
+                
+                # ===== FEEDBACK GUI INTEGRATION =====
+                if feedback_mode and not (use_deep_sold_detection or sold_items_only):
+                    print("\n" + "="*60)
+                    print("🎯 CREATING FEEDBACK INTERFACE")
+                    print("="*60)
+                    print("This interface allows you to review and correct AI predictions")
+                    print("to improve future scraping accuracy through machine learning.")
+                    
+                    try:
+                        # Import the FeedbackLearning class
+                        from src.training_manager import FeedbackLearning
+                        
+                        # Create feedback system - FIXED CONSTRUCTOR
+                        print("🔧 Initializing feedback system...")
+                        
+                        # Try with session_id first, fallback to without if it fails
+                        try:
+                            feedback_system = FeedbackLearning(
+                                scraper_output_dir=output_dir,
+                                session_id=session_id
+                            )
+                        except TypeError:
+                            # Fallback for original constructor without session_id
+                            feedback_system = FeedbackLearning(
+                                scraper_output_dir=output_dir
+                            )
+                        
+                        # Create the feedback interface
+                        print("📋 Generating feedback interface...")
+                        feedback_html = feedback_system.create_feedback_interface(
+                            session_id=session_id,
+                            scraped_posts=posts
+                        )
+                        
+                        if feedback_html:
+                            print(f"✅ Feedback interface created successfully!")
+                            print(f"📄 File location: {feedback_html}")
+                            print(f"📊 Ready to review {len(posts)} predictions")
+                            
+                            print("\n📋 FEEDBACK WORKFLOW:")
+                            print("1. 📖 Review each prediction in the interface")
+                            print("2. ✅ Mark predictions as CORRECT or ❌ WRONG")
+                            print("3. 💾 Export your feedback as JSON file")
+                            print("4. 🤖 Apply feedback to retrain models (optional)")
+                            
+                            print("\n💡 WHY PROVIDE FEEDBACK:")
+                            print("• Even 95% confident predictions can be wrong")
+                            print("• Your corrections improve DOM ML accuracy")
+                            print("• Better models = fewer manual reviews needed")
+                            print("• Helps catch edge cases the system missed")
+                            
+                            # Ask user if they want to open it automatically
+                            if not autonomous_mode:
+                                open_now = input("\nOpen feedback interface now? (y/n, default=y): ").strip().lower()
+                                if open_now != 'n':
+                                    try:
+                                        import webbrowser
+                                        import os
+                                        
+                                        # Convert to absolute path for browser
+                                        abs_path = os.path.abspath(feedback_html)
+                                        webbrowser.open(f"file:///{abs_path}")
+                                        print("✅ Opened feedback interface in browser")
+                                        
+                                        print("\n⏳ NEXT STEPS:")
+                                        print("1. Review the predictions in your browser")
+                                        print("2. When done, come back here")
+                                        
+                                        # Wait for user to complete feedback
+                                        input("\nPress Enter when you've completed the feedback review...")
+                                        
+                                        # Ask if they want to apply feedback immediately
+                                        apply_now = input("Apply feedback to retrain models now? (y/n, default=n): ").strip().lower()
+                                        if apply_now == 'y':
+                                            print("\n🤖 Looking for downloaded feedback file...")
+                                            print("💡 The feedback file should be in your Downloads folder")
+                                            print("   Named like: scraping_feedback_20250912_065943_2025-09-12T07-15-30.json")
+                                            
+                                            feedback_file = input("\nEnter path to feedback JSON file (or press Enter to skip): ").strip()
+                                            if feedback_file and os.path.exists(feedback_file):
+                                                success = apply_feedback_from_file(feedback_file, str(output_dir))
+                                                if success:
+                                                    print("🎉 Models retrained successfully!")
+                                                else:
+                                                    print("❌ Retraining failed - check logs for details")
+                                            elif feedback_file:
+                                                print(f"❌ File not found: {feedback_file}")
+                                                print("💡 You can apply feedback later using apply_feedback_from_file()")
+                                            else:
+                                                print("⏭️ Skipping feedback application")
+                                                print("💡 You can apply feedback later using apply_feedback_from_file()")
+                                        
+                                    except Exception as e:
+                                        print(f"⚠️ Could not auto-open browser: {e}")
+                                        print(f"Please manually open: {feedback_html}")
+                                else:
+                                    print("📝 Feedback interface ready for manual access")
+                                    print(f"💡 Open when ready: {feedback_html}")
+                                    
+                            else:
+                                print(f"🤖 Autonomous mode: Feedback interface ready")
+                                print(f"📄 Location: {feedback_html}")
+                                print("💡 Open manually when ready to provide feedback")
+                                
+                        else:
+                            print("ℹ️ No feedback interface created")
+                            print("   Reason: No prediction data available or all predictions were identical")
+                            
+                    except Exception as e:
+                        print(f"❌ Error creating feedback interface: {e}")
+                        print("💡 You can manually create feedback later using:")
+                        print("   from src.training_manager import FeedbackLearning")
+                        print(f"   feedback_system = FeedbackLearning('{output_dir}')")
+                        print(f"   feedback_system.create_feedback_interface('{session_id}', posts)")
+                
+                elif feedback_mode:
+                    print("\n📝 Note: Feedback interface not available for this scraping mode")
+                    print("   (Only available for enhanced 3-layer scraping)")
+                    
+            else:
+                print(f"\n😞 No posts found after scraping attempts")
         
         else:
-            print("\nCould not connect to browser")
+            print("\n❌ Could not connect to browser")
             
     except KeyboardInterrupt:
-        print("\n\nScraping interrupted by user")
-        if hasattr(scraper, 'posts_data') and scraper.posts_data:
-            try:
-                await scraper.save_results_fixed()
-                print(f"Saved {len(scraper.posts_data)} posts that were scraped")
-            except Exception as e:
-                print(f"Error saving interrupted data: {str(e)[:100]}")
+        print("\n\n⏹️ Scraping interrupted by user")
+                
     except Exception as e:
-        print(f"\nUnexpected error: {str(e)}")
+        print(f"\n💥 Unexpected error in main: {str(e)}")
         import traceback
         traceback.print_exc()
+        
     finally:
         await scraper.close()
-        
+     
 if __name__ == "__main__":
+    print("🔥🔥🔥 CALLING MAIN() NOW 🔥🔥🔥")
     asyncio.run(main())
