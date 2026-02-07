@@ -22,3 +22,12 @@ Thumbs.db
 
 # Conda environment
 tcp_data/
+
+# Temp/upload artifacts
+.tmp.driveupload/
+
+# Virtual environments (project-specific)
+venv_scraper/
+
+# Model artifacts (large binary files)
+models/**/*.pkl
